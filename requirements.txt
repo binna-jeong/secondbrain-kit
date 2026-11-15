@@ -1,4 +1,5 @@
-# secondbrain-kit venv (Python 3.12). claude-mem 의 chroma-mcp 0.2.6 이 쓰는 chromadb 와 디스크 포맷을 맞춘다.
+# secondbrain-kit venv (Python 3.12). claude-mem 워커의 chroma-mcp 가 쓰는 chromadb 와 디스크 포맷을 맞춘다.
+# 일부러 고정한다 — 워커 판(worker-service.cjs 의 --with chromadb==)이 바뀌면 doctor 가 ⚠로 알리고, 사람이 검증한 뒤 올린다.
 chromadb==1.5.9
 openai>=1.0
 kiwipiepy>=0.23

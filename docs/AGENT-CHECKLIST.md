@@ -67,7 +67,7 @@
 |---|---|---|
 | [1] 필수 도구 없음 | node/git 미설치, Node 20.12 미만 | 사용자에게 설치 명령 안내 후 재실행 |
 | [2] venv | uv 설치 직후 PATH 미반영 | 새 터미널에서 재실행 |
-| [3] claude-mem | npm 네트워크, 권한 | `npx -y claude-mem@13.24.23 install --provider <p> --no-auto-start`를 직접 실행해 오류 확인 |
+| [3] claude-mem | npm 네트워크, 권한 | `npx -y claude-mem@<권장판> install --provider <p> --no-auto-start`(권장판: `python bin/sb_claude_mem.py`의 `recommended`)를 직접 실행해 오류 확인 |
 | [3] `chroma-mcp 고정 설치 실패` 경고 | uv 네트워크, uv 없음 | 그대로 두면 벡터 동기화가 pydantic 2.14로 멈출 수 있다. 원인을 고친 뒤 설치기 재실행 → doctor `chroma-mcp 기동` ✅ 확인 |
 | [4] 임베딩 | Ollama 서버 미기동, 모델 다운로드 실패 | Ollama 앱 실행 → 재실행(BGE-m3-ko GGUF 1.2GB를 받는다. 실패하면 bge-m3로 내려감). 급하면 `--no-embed` |
 | [7] Codex | 신뢰 등록 실패 | venv 파이썬으로 `installer/codex_trust.py trust --match "<키트 경로>"` |

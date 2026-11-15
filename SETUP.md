@@ -93,7 +93,7 @@ Codex만 쓰는 PC(Claude 구독 없음)라면 설치 전에 관측 요약 LLM�
 | `~/.claude/settings.json` | 훅 6종 추가 — SessionStart · UserPromptSubmit · PreToolUse(AskUserQuestion) · Stop · SubagentStart · PostToolUseFailure(Claude Code 2.1.119 이상만, 그보다 낮으면 5종). 기존 훅은 그대로 |
 | `~/.codex/hooks.json`, `config.toml` | Codex 캡처·주입 훅 + 신뢰 등록 |
 | `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` | "세컨브레인 기억 규칙" 블록 추가 (기존 내용은 그대로) |
-| uv 도구 `chroma-mcp` | pydantic 2.14 미만으로 고정한 chroma-mcp 0.2.6. claude-mem 워커가 이것을 다시 써서 벡터 동기화가 pydantic 비호환으로 멈추지 않는다 |
+| uv 도구 `chroma-mcp` | 설치된 claude-mem 워커와 같은 요구에 pydantic 2.14 미만 고정을 더한 chroma-mcp(버전은 워커가 정한다). claude-mem 워커가 이것을 다시 써서 벡터 동기화가 pydantic 비호환으로 멈추지 않는다 |
 | 자동 작업 | 한국어 색인 매시간, 야간 정리 05:07 (맥 launchd / 윈도우 작업 스케줄러) |
 | 상주 회수 서버 | `sb_recalld`(127.0.0.1:37791). 스케줄이 아니라 세션을 열 때 뜨고, 6시간 쓰지 않으면 스스로 꺼진다 |
 

@@ -89,19 +89,21 @@ def worker_up() -> bool:
 
 
 def plugin_root() -> Optional[Path]:
-    """설치된 claude-mem 플러그인 중 가장 높은 버전(고아 표시 제외)."""
-    base = Path(os.environ.get('CLAUDE_CONFIG_DIR') or '~/.claude').expanduser() / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem'
-    best = None
-    for d in base.glob('*') if base.is_dir() else []:
-        if (d / '.orphaned_at').exists() or not (d / 'scripts' / 'worker-service.cjs').is_file():
-            continue
-        try:
-            key = tuple(int(x) for x in d.name.split('-')[0].split('.'))
-        except ValueError:
-            continue
-        if best is None or key > best[0]:
-            best = (key, d)
-    return best[1] if best else None
+    """설치된 claude-mem 플러그인 중 가장 높은 버전(고아 표시 제외). 기준은 sb_claude_mem 한 곳."""
+    import sb_claude_mem
+    return sb_claude_mem.plugin_root()
+
+
+def check_claude_mem_version() -> Dict[str, Any]:
+    """설치된 claude-mem 이 키트 검증 범위 밖이면 경고만 한다(고치기 없음). 세션 시작마다 도는 점검이라
+    worker-service.cjs(수 MB)는 읽지 않는다 — 워커 인자 확인은 doctor 몫."""
+    import sb_claude_mem
+    v = sb_claude_mem.installed_version()
+    if not v or sb_claude_mem.in_tested(v):
+        return {'ok': True, 'version': v}
+    lo, hi = sb_claude_mem.TESTED
+    return {'ok': False, 'version': v, 'fix': None,
+            'msg': 'claude-mem {}는 키트 검증 범위({}~{}) 밖 — `python installer/install.py --doctor`로 chroma-mcp 기동 확인'.format(v, lo, hi)}
 
 
 def ensure_worker(wait: float = 30.0) -> bool:
@@ -526,6 +528,7 @@ def run_checks(services: bool = True, worker: bool = True, recall: bool = True) 
         if uses_ollama():
             o = ollama_up()
             out['ollama'] = {'ok': o, 'msg': '' if o else 'Ollama 꺼짐(벡터 저장 중단)', 'fix': None if o else 'ollama'}
+    out['claude-mem-version'] = check_claude_mem_version()
     out['nightly'] = check_nightly()
     out['automemory'] = check_automemory()
     try:

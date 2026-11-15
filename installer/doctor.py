@@ -20,6 +20,7 @@ KIT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(KIT / 'bin'))
 sys.path.insert(0, str(KIT / 'installer'))
 import sb_config  # noqa: E402
+import sb_claude_mem  # noqa: E402
 import install  # noqa: E402  설치기와 같은 조건(Claude 버전 게이트·같은 역할 훅 판별)으로 점검한다
 
 HOME = Path.home()
@@ -124,9 +125,36 @@ def check_embedding():
             rec('✅' if ok else '❌', '~/.chroma_env', '있음' if ok else 'CHROMA_OPENAI_API_KEY=ollama 줄 필요')
 
 
-# claude-mem 13.24.23 워커가 chroma-mcp 를 띄우는 인자(worker-service.cjs buildLauncherPrefix, --python 은 앞에 붙는다).
-# 설치기의 CHROMA_UVX 와 달리 pydantic 고정이 없다 — 설치기가 깔아 둔 고정 도구를 uvx 가 재사용하는지가 관건.
-WORKER_CHROMA_ARGS = ['--with', 'onnxruntime>=1.20', '--with', 'protobuf<7', '--from', 'chroma-mcp==0.2.6', 'chroma-mcp']
+def venv_chromadb():
+    """키트 venv 의 chromadb 버전(없거나 못 읽으면 None)."""
+    if not VPY.exists():
+        return None
+    try:
+        r = subprocess.run([str(VPY), '-c', 'import chromadb; print(chromadb.__version__)'], timeout=60, **UTF8)
+    except Exception:  # noqa: BLE001
+        return None
+    return (r.stdout or '').strip() or None if r.returncode == 0 else None
+
+
+def check_claude_mem_version():
+    """설치된 claude-mem 이 키트 검증 범위 안인지, 워커가 고정한 chromadb 가 키트 venv 와 같은지(경고만, 차단 없음)."""
+    root = sb_claude_mem.plugin_root()
+    v = sb_claude_mem.installed_version(root)
+    if not v:
+        return rec('⚠', 'claude-mem 버전', '플러그인 캐시에서 설치판을 못 찾음 — install.py 재실행')
+    lo, hi = sb_claude_mem.TESTED
+    if sb_claude_mem.in_tested(v):
+        rec('✅', 'claude-mem 버전', '%s (키트 검증 %s~%s, 권장 %s)' % (v, lo, hi, sb_claude_mem.RECOMMENDED))
+    else:
+        rec('⚠', 'claude-mem 버전', '%s — 키트 검증 범위(%s~%s) 밖. 아래 chroma-mcp 기동 결과를 확인하세요' % (v, lo, hi))
+    withs, _, ok = sb_claude_mem.worker_chroma_spec(root)
+    want = sb_claude_mem.pinned_chromadb(withs) if ok else None
+    have = venv_chromadb()
+    if want and have and want != have:
+        rec('⚠', 'chromadb 판 일치', '워커 %s / 키트 venv %s — 디스크 포맷이 갈릴 수 있음(requirements.txt 를 워커 판에 맞춘 키트로 갱신)'
+            % (want, have))
+    elif want and have:
+        rec('✅', 'chromadb 판 일치', '%s' % have)
 
 
 def check_chroma_mcp():
@@ -139,21 +167,24 @@ def check_chroma_mcp():
     uvx = shutil.which('uvx')
     if not uvx:
         return rec('❌', 'chroma-mcp 기동', 'uvx 없음 — 워커가 chroma-mcp 를 띄울 수 없어 벡터 동기화가 멈춤')
-    py = os.environ.get('CLAUDE_MEM_PYTHON_VERSION') or s.get('CLAUDE_MEM_PYTHON_VERSION') or '3.13'
+    py = sb_claude_mem.python_version(s)
+    withs, ver, parsed = sb_claude_mem.worker_chroma_spec()
     # 워커처럼 가상환경 변수는 빼고 띄운다(uv run 으로 doctor 를 돌리면 VIRTUAL_ENV 가 잡혀 있다)
     env = {k: v for k, v in UTF8['env'].items()
            if k not in ('VIRTUAL_ENV', 'PYTHONHOME', 'PYTHONPATH', 'CONDA_PREFIX', 'CONDA_DEFAULT_ENV')}
     try:
-        r = subprocess.run([uvx, '--python', py] + WORKER_CHROMA_ARGS + ['--help'], cwd=str(HOME), timeout=300,
+        r = subprocess.run([uvx, '--python', py] + sb_claude_mem.worker_args(withs, ver) + ['--help'], cwd=str(HOME), timeout=300,
                            **dict(UTF8, env=env))
     except subprocess.TimeoutExpired:
         return rec('⚠', 'chroma-mcp 기동', '5분 안에 안 뜸(첫 실행은 패키지 내려받기로 오래 걸림) — 다시 확인')
     out = (r.stderr or '') + (r.stdout or '')
     if r.returncode == 0:
+        if not parsed:
+            return rec('⚠', 'chroma-mcp 기동', '기본 인자로는 기동 — 설치된 워커 인자를 읽지 못함(worker-service.cjs 형식 변경?)')
         return rec('✅', 'chroma-mcp 기동', '워커와 같은 인자로 정상 기동')
     if 'eval_type_backport' in out:
         return rec('❌', 'chroma-mcp 기동', 'pydantic 2.14+ 와 mcp 1.6.0 비호환으로 시작 즉시 ImportError — 벡터 동기화 멈춤. '
-                   'install.py 를 다시 실행해 고정 도구(uv tool install … pydantic<2.14 chroma-mcp==0.2.6)를 까세요')
+                   'install.py 를 다시 실행해 고정 도구(워커 인자 + %s)를 까세요' % sb_claude_mem.PYDANTIC_PIN)
     tail = [x for x in out.strip().splitlines() if x.strip()]
     rec('❌', 'chroma-mcp 기동', 'rc=%d %s' % (r.returncode, (tail[-1] if tail else '')[:120]))
 
@@ -304,7 +335,7 @@ def main() -> int:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     except Exception:  # noqa: BLE001
         pass
-    for fn in (check_venv, check_worker, check_settings, check_embedding, check_chroma_mcp, check_claude, check_codex,
+    for fn in (check_venv, check_worker, check_settings, check_embedding, check_claude_mem_version, check_chroma_mcp, check_claude, check_codex,
                check_rules, check_state_and_capture, check_sb):
         try:
             fn()

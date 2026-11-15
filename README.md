@@ -58,7 +58,7 @@ irm https://raw.githubusercontent.com/fivetaku/secondbrain-kit/main/bootstrap.ps
 
 설치가 하는 일 (모두 멱등, 바꾸는 설정 파일은 `.sbkit-bak-<시각>`으로 백업):
 1. `~/.secondbrain/.venv` 생성, 상태층 DB 초기화
-2. `npx claude-mem install` — Claude Code 플러그인 등록, bun/uv 설치. 이어서 chroma-mcp 고정 도구 설치(`uv tool install … --with "pydantic<2.14" chroma-mcp==0.2.6`) — 2026-10-12에 uvx가 pydantic 2.14를 받아 오자 chroma-mcp 0.2.6이 시작하자마자 ImportError로 죽고 벡터 동기화가 4시간 넘게 멈췄다. claude-mem 워커는 자기 인자로 chroma-mcp를 띄우지만, 조건에 맞는 설치 도구가 있으면 uvx가 그것을 다시 쓰므로 고정이 워커에도 걸린다([docs/embedding.md](docs/embedding.md#chroma-mcp-버전-고정))
+2. `npx claude-mem@<권장판> install`(권장판은 `bin/sb_claude_mem.py`의 `RECOMMENDED`, `SBKIT_CLAUDE_MEM_VERSION`으로 바꿀 수 있다) — Claude Code 플러그인 등록, bun/uv 설치. 이어서 chroma-mcp 고정 도구 설치(설치된 워커의 인자 + `pydantic<2.14`로 `uv tool install`, 기준값은 `bin/sb_claude_mem.py`) — 2026-10-12에 uvx가 pydantic 2.14를 받아 오자 chroma-mcp 0.2.6이 시작하자마자 ImportError로 죽고 벡터 동기화가 4시간 넘게 멈췄다. claude-mem 워커는 자기 인자로 chroma-mcp를 띄우지만, 조건에 맞는 설치 도구가 있으면 uvx가 그것을 다시 쓰므로 고정이 워커에도 걸린다([docs/embedding.md](docs/embedding.md#chroma-mcp-버전-고정))
 3. BGE-m3-ko GGUF를 받아 Ollama `bge-m3-ko` 생성(실패 시 `bge-m3`), Chroma 컬렉션을 한국어 임베딩으로 선생성, `~/.chroma_env`
 4. claude-mem 설정(한국어 관측 모드, 주입량) — 이미 있는 값은 건드리지 않음
 5. Claude Code 훅 6종 (`~/.claude/settings.json`, 기존 훅은 보존): SessionStart · UserPromptSubmit · PreToolUse(AskUserQuestion) · Stop · SubagentStart · PostToolUseFailure. PostToolUseFailure(오류 시점 회수)는 Claude Code 2.1.119 이상에서만 걸고, 그보다 낮으면 5종이다 — 2.1.101 이전 버전은 모르는 이벤트가 하나라도 있으면 settings.json 전체를 무시하기 때문이다. 같은 역할의 사용자 훅이 이미 있으면 그 이벤트는 건너뛴다

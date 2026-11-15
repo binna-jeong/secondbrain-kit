@@ -31,7 +31,8 @@ Claude Code 훅 ─┐   Codex 훅(hooks/codex_hook.py: exec 자동화 제외) �
 |---|---|
 | `bootstrap.sh` / `bootstrap.ps1` | GitHub 한 줄 설치 진입점(clone/pull → install) |
 | `install.sh` / `install.ps1` | uv 확보 후 `installer/install.py` 실행 |
-| `installer/install.py` | 설치·제거(`--uninstall`)·점검(`--doctor`). 모든 단계 멱등, 설정 파일은 `.sbkit-bak-<시각>` 백업. chroma-mcp 고정 도구(`uv tool install`, pydantic<2.14)도 여기서 깐다 |
+| `installer/install.py` | 설치·제거(`--uninstall`)·점검(`--doctor`). 모든 단계 멱등, 설정 파일은 `.sbkit-bak-<시각>` 백업. chroma-mcp 고정 도구(`uv tool install`, 설치된 워커 인자 + pydantic<2.14)도 여기서 깐다 |
+| `bin/sb_claude_mem.py` | claude-mem 권장판·키트 검증 범위·chroma-mcp 워커 인자의 기준값과 worker-service.cjs 파서. claude-mem 새 버전을 검증하면 `TESTED` 상한과 `tests/fixtures/claude-mem/` 조각을 함께 갱신한다 |
 | `installer/doctor.py` | 설치 상태 점검(읽기 전용) |
 | `installer/codex_trust.py` | Codex 훅 신뢰 등록·목록·끄기·되돌리기 (app-server JSON-RPC) |
 | `bin/sb.py` | `sb` 단일 CLI |
@@ -82,7 +83,7 @@ venv 파이썬: 맥 `~/.secondbrain/.venv/bin/python`, 윈도우 `~/.secondbrain
 
 | 증상 | 확인 | 조치 |
 |---|---|---|
-| 세션 기록이 안 쌓임(Claude) | worker 로그에 `INIT_COMPLETE` 없음, `runner-errors.log` | `~/.claude/settings.json`에 claude-mem 플러그인 활성(`enabledPlugins`), `npx claude-mem@13.24.23 repair` |
+| 세션 기록이 안 쌓임(Claude) | worker 로그에 `INIT_COMPLETE` 없음, `runner-errors.log` | `~/.claude/settings.json`에 claude-mem 플러그인 활성(`enabledPlugins`), `npx claude-mem@<설치판> repair`(설치판은 `python bin/sb_claude_mem.py`의 `installed`) |
 | 세션 기록이 안 쌓임(Codex) | `codex_trust.py list`에서 키트 훅이 `trusted`인지 | 미신뢰면 `codex_trust.py trust --match "<키트 경로>"`. exec 세션은 설계상 제외(`SB_CODEX_CAPTURE_EXEC=1`로 강제) |
 | 특정 폴더만 안 쌓임 | 로그에 `Project excluded from tracking` | `~/.claude-mem/settings.json`의 `CLAUDE_MEM_EXCLUDED_PROJECTS` |
 | 한국어 의미 검색이 안 됨 | doctor `벡터 임베딩`, `Ollama` | Ollama 실행, 설치기 재실행(4단계가 bge-m3-ko 준비), `~/.chroma_env`에 `CHROMA_OPENAI_API_KEY=ollama` |

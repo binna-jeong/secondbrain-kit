@@ -10,6 +10,7 @@
   1  사전 요구사항 확인 (node, git, uv, claude, codex, ollama)
   2  venv (~/.secondbrain/.venv) + requirements
   3  claude-mem 설치 (npx claude-mem install — bun/uv 자동 설치, 플러그인 등록까지) + chroma-mcp 고정 도구
+     (권장판·워커 인자는 bin/sb_claude_mem.py 가 기준)
   4  한국어 임베딩: Ollama bge-m3-ko(BGE-m3-ko GGUF, 실패 시 bge-m3) + Chroma 컬렉션 선생성(OpenAI 호환 EF → Ollama /v1)
   5  claude-mem settings.json 병합 (한국어 모드, 주입량)
   6  Claude Code 훅 (~/.claude/settings.json)
@@ -40,12 +41,10 @@ SB_HOME = Path(os.environ.get('SB_HOME') or HOME / '.secondbrain')
 VENV = SB_HOME / '.venv'
 VPY = VENV / ('Scripts/python.exe' if IS_WIN else 'bin/python')
 CM_DIR = HOME / '.claude-mem'
-CLAUDE_MEM_VERSION = os.environ.get('SBKIT_CLAUDE_MEM_VERSION', '13.24.23')
-# pydantic<2.14: 2026-10-12 uvx 가 chroma-mcp 환경을 새로 풀며 pydantic 2.14.1 을 받았고, chroma-mcp 0.2.6 이 고정한
-# mcp 1.6.0 이 2.14 에서 사라진 pydantic._internal._typing_extra.eval_type_backport 를 import 해 시작 즉시 죽었다
-# (벡터 동기화 4시간+ 정지). 2026-10-30 고정 없이 다시 띄워도 같은 ImportError 재현.
-CHROMA_UVX = ['--python', '3.13', '--with', 'onnxruntime>=1.20', '--with', 'protobuf<7',
-              '--with', 'pydantic<2.14', '--from', 'chroma-mcp==0.2.6']
+sys.path.insert(0, str(KIT / 'bin'))
+import sb_claude_mem  # noqa: E402  claude-mem 버전·chroma-mcp 워커 인자의 기준값(한 곳)
+
+CLAUDE_MEM_VERSION = os.environ.get('SBKIT_CLAUDE_MEM_VERSION', sb_claude_mem.RECOMMENDED)
 MARK_BEGIN = '<!-- secondbrain-kit:begin -->'
 MARK_END = '<!-- secondbrain-kit:end -->'
 HOOK_TAG = 'secondbrain-kit'
@@ -227,14 +226,31 @@ def install_claude_mem(args, tools) -> None:
     run(cmd if not IS_WIN else ['cmd', '/c'] + cmd)
 
 
+def chroma_uvx_args(settings=None):
+    """(설치된 워커와 같은 요구 + pydantic 고정을 담은 uvx 인자, 워커 인자 읽기 성공 여부).
+    끝은 '--from chroma-mcp==<버전>' 이다 — uvx 명령 앞부분으로 쓰거나 [:-2]+[-1] 로 uv tool install 인자로 바꾼다."""
+    withs, ver, ok = sb_claude_mem.worker_chroma_spec()
+    py = sb_claude_mem.python_version(settings if settings is not None else read_json(CM_DIR / 'settings.json'))
+    args = ['--python', py]
+    for w in sb_claude_mem.tool_requirements(withs):
+        args += ['--with', w]
+    return args + ['--from', 'chroma-mcp==%s' % ver], ok
+
+
 def pin_chroma_mcp(tools) -> None:
     """claude-mem 워커가 띄우는 chroma-mcp 에도 pydantic 고정이 걸리게 한다.
-    워커는 자기 인자(uvx --python 3.13 --with onnxruntime>=1.20 --with protobuf<7 --from chroma-mcp==0.2.6 chroma-mcp)로
-    직접 띄워 CHROMA_UVX 가 닿지 않는다. uvx 는 요구를 만족하는 설치된 도구(uv tool install)가 있으면 새로 풀지 않고
-    그 환경을 쓰므로(uv 0.10 실측 'Using existing tool'), 고정을 담아 도구로 설치해 둔다. 이미 같으면 uv 가 건너뛴다."""
-    say('  chroma-mcp 고정 (pydantic<2.14)')
+    워커는 자기 인자(uvx --python <py> --with … --from chroma-mcp==<버전> chroma-mcp)로 직접 띄우므로 설치기 인자가
+    닿지 않는다. uvx 는 같은 이름의 설치된 도구(uv tool install)가 워커의 --python 과 모든 --with 를 이미 만족할 때만
+    그 환경을 재사용한다(uv 0.10 실측 'Using existing tool'). 그래서 설치된 워커 인자를 읽어 그 요구 전부에 pydantic
+    고정을 더해 도구로 깐다 — 하나라도 빠지면(예: 13.29+ 워커의 chromadb==1.5.9) chromadb 새 판이 나오는 순간 재사용이
+    끊기고 pydantic 최신판으로 죽는다. 같은 요구면 uv 가 건너뛰고, claude-mem 을 올린 뒤 다시 돌리면 도구를 고쳐 깐다."""
+    args, ok = chroma_uvx_args()
+    say('  chroma-mcp 고정 도구 (워커 인자 + %s)' % sb_claude_mem.PYDANTIC_PIN)
+    if not ok:
+        WARNINGS.append('claude-mem 워커 인자를 읽지 못해 기본값(claude-mem %s 기준)으로 chroma-mcp 고정 도구를 깔았습니다 — '
+                        '--doctor 의 chroma-mcp 기동 확인' % sb_claude_mem.RECOMMENDED)
     uv = tools.get('uv') or 'uv'
-    r = run([uv, 'tool', 'install'] + CHROMA_UVX[:-2] + [CHROMA_UVX[-1]], check=False)
+    r = run([uv, 'tool', 'install'] + args[:-2] + [args[-1]], check=False)
     if r.returncode != 0:
         WARNINGS.append('chroma-mcp 고정 설치 실패 — 벡터 동기화가 pydantic 2.14 로 멈출 수 있음(--doctor 의 chroma-mcp 기동 확인)')
 
@@ -438,7 +454,7 @@ def setup_embedding(args, tools) -> None:
         tmp.write_text(PRECREATE, encoding='utf-8')
     env = dict(os.environ)
     env.pop('OPENAI_API_KEY', None)
-    run([tools['uvx'] or 'uvx'] + CHROMA_UVX + ['python', str(tmp), str(chroma), model], env=env)
+    run([tools['uvx'] or 'uvx'] + chroma_uvx_args()[0] + ['python', str(tmp), str(chroma), model], env=env)
     say('  컬렉션 ef=%s' % (chroma_ef_name(chroma) or '(dry-run)'))
 
 
