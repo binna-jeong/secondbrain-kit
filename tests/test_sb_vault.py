@@ -65,7 +65,7 @@ class VaultEnv(unittest.TestCase):
         con.execute('CREATE TABLE observations (memory_session_id TEXT, project TEXT, type TEXT, created_at_epoch INTEGER)')
         sessions = [('a1', 'alpha', self.alpha, 60, now), ('a2', 'alpha', self.alpha / 'sub', 30, now),
                     ('b1', 'beta', self.beta, 40, old), ('h1', 'home', self.home, 500, now),
-                    ('t1', 'trigger', Path(tempfile.gettempdir()) / 'x', 300, now), ('s1', 'small', self.small, 2, now)]
+                    ('t1', 'trigger', Path('/tmp/sbvault-test-trigger'), 300, now), ('s1', 'small', self.small, 2, now)]
         for sid, tag, cwd, n, t in sessions:
             con.execute('INSERT INTO sdk_sessions VALUES (?,?,?,?)', (sid, tag, str(cwd), t))
             con.executemany('INSERT INTO observations VALUES (?,?,?,?)',
@@ -114,8 +114,11 @@ class AnalyzeTests(VaultEnv):
             return real(sock, addr)
         with mock.patch.object(socket.socket, 'connect', guard):
             self.analysis()
-            os.environ['SB_VAULT_LLM'] = 'auto'   # auto 여도 경로 설정이 없으면 부르지 않는다
+            os.environ['SB_VAULT_LLM'] = 'on'   # 켜도 볼트 전용 경로가 없으면 부르지 않는다
             self.analysis()
+            os.environ.pop('SB_VAULT_LLM')     # 다른 기능의 LLM 설정만 있으면 기본(끔)으로 부르지 않는다
+            with mock.patch.dict(os.environ, {'SB_CORRECTION_LLM_URL': 'http://127.0.0.1:9/x', 'SB_CORRECTION_MODEL': 'm'}):
+                self.analysis()
         self.assertEqual(calls, [])
 
     def test_llm_receives_folder_parts_only(self):
@@ -136,7 +139,7 @@ class AnalyzeTests(VaultEnv):
         con.execute('INSERT INTO sdk_sessions VALUES (?,?,?,?)', ('g1', 'src', str(gen), int(time.time() * 1000)))
         con.executemany('INSERT INTO observations VALUES (?,?,?,?)', [('g1', 'src', 'discovery', 1)] * 30)
         con.commit(); con.close()
-        with mock.patch.dict(os.environ, {'SB_VAULT_LLM': 'auto', 'SB_VAULT_LLM_URL': 'http://127.0.0.1:9/v1/chat/completions',
+        with mock.patch.dict(os.environ, {'SB_VAULT_LLM': 'on', 'SB_VAULT_LLM_URL': 'http://127.0.0.1:9/v1/chat/completions',
                                           'SB_VAULT_MODEL': 'm'}), \
                 mock.patch.object(sb_vault.urllib.request, 'urlopen', fake):
             a = self.analysis()
@@ -178,15 +181,107 @@ class PlanApplyTests(VaultEnv):
         self.assertTrue(rec['verify']['ok'])
         self.assertEqual(sha(settings), before)
 
-    def test_existing_alias_conflict_kept(self):
+    def test_existing_alias_key_is_not_reused(self):
+        # 기존 별칭 'beta' 가 다른 경로를 가리키면 새 후보는 다른 이름으로 — 기존 별칭은 그대로
         ap = self.sbhome / 'config' / 'project_aliases.json'
         ap.write_text(json.dumps({'beta': [str(self.home / 'elsewhere')]}), encoding='utf-8')
         p = self.plan()
-        self.assertTrue(any(c['key'] == 'beta' for c in p['conflicts']))
         self.assertNotIn('beta', p['aliases'])
+        self.assertIn('code-beta', {sc['key'] for sc in p['scopes']})   # 상위 폴더 이름을 붙여 겹치지 않게
         rec = sb_vault.apply_plan(p, p['plan_hash'])
         self.assertTrue(rec['verify']['ok'])
         self.assertEqual(json.loads(ap.read_text())['beta'], [str(self.home / 'elsewhere')])
+
+    def test_name_alias_is_recognized(self):
+        ap = self.sbhome / 'config' / 'project_aliases.json'
+        ap.write_text(json.dumps({'client-work': ['beta']}), encoding='utf-8')   # 경로 없는 이름 별칭
+        p = self.plan()
+        keys = {sc['key']: sc for sc in p['scopes']}
+        self.assertIn('client-work', keys)
+        self.assertNotIn('beta', p['aliases'])                     # 새 경로 별칭으로 scope 를 바꾸지 않는다
+
+    def test_broken_settings_aborts_before_any_write(self):
+        settings = self.claude / 'settings.json'
+        settings.write_text('{"env": ', encoding='utf-8')          # 잘린 JSON
+        ap = self.sbhome / 'config' / 'project_aliases.json'
+        ap.write_text('{}\n', encoding='utf-8')
+        before = (sha(settings), sha(ap))
+        p = self.plan('listed')
+        with self.assertRaises(SystemExit):
+            sb_vault.apply_plan(p, p['plan_hash'])
+        self.assertEqual((sha(settings), sha(ap)), before)
+        self.assertFalse(sb_vault.vault_json_path().exists())
+
+    def test_short_hash_rejected(self):
+        p = self.plan()
+        with self.assertRaises(SystemExit):
+            sb_vault.apply_plan(p, p['plan_hash'][:4])
+
+    def test_concurrent_apply_is_locked(self):
+        p = self.plan()
+        with sb_vault._Lock():
+            with self.assertRaises(SystemExit):
+                sb_vault.apply_plan(p, p['plan_hash'])
+
+    def test_rollback_rejects_foreign_record(self):
+        p = self.plan()
+        rec = sb_vault.apply_plan(p, p['plan_hash'])
+        data = json.loads(Path(rec['apply_path']).read_text())
+        data['backups'].append({'name': 'evil', 'target': str(self.home / 'victim.txt'), 'backup_path': None,
+                                'sha256_before': None})
+        Path(rec['apply_path']).write_text(json.dumps(data), encoding='utf-8')
+        (self.home / 'victim.txt').write_text('keep', encoding='utf-8')
+        with self.assertRaises(SystemExit):
+            sb_vault.rollback(Path(rec['apply_path']))
+        self.assertEqual((self.home / 'victim.txt').read_text(), 'keep')
+
+    def test_record_write_failure_rolls_back(self):
+        ap = self.sbhome / 'config' / 'project_aliases.json'
+        ap.write_text('{}\n', encoding='utf-8')
+        before = sha(ap)
+        p = self.plan()
+        real = sb_vault._atomic_write
+        calls = {'n': 0}
+
+        def flaky(path, data, private=False):
+            if str(path).endswith('.json') and '/vault/apply-' in str(path):
+                calls['n'] += 1
+                if calls['n'] == 2:      # 첫 기록(write-ahead)은 되고, 결과 기록에서 디스크가 찬다
+                    raise OSError(28, 'No space left on device')
+            return real(path, data, private)
+        with mock.patch.object(sb_vault, '_atomic_write', flaky):
+            rec = sb_vault.apply_plan(p, p['plan_hash'])
+        self.assertFalse(rec['verify']['ok'])
+        self.assertTrue(rec['rolled_back'])
+        self.assertEqual(sha(ap), before)
+
+    def test_same_suggested_key_gets_unique_suffix(self):
+        con = sqlite3.connect(self.db)
+        now = int(time.time() * 1000)
+        for i, root in enumerate((self.home / 'one' / 'a' / 'src', self.home / 'two' / 'a' / 'src')):
+            root.mkdir(parents=True)
+            con.execute('INSERT INTO sdk_sessions VALUES (?,?,?,?)', ('k%d' % i, 'src', str(root), now))
+            con.executemany('INSERT INTO observations VALUES (?,?,?,?)', [('k%d' % i, 'src', 'discovery', now)] * 25)
+        con.commit(); con.close()
+        p = sb_vault.make_plan(self.analysis(), None, 'all')
+        keys = [sc['key'] for sc in p['scopes']]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertIn('a-src', keys)
+        self.assertIn('a-src-2', keys)
+
+    def test_non_git_nested_folders_share_root(self):
+        ws = self.home / 'ws'
+        (ws / 'sub').mkdir(parents=True)
+        con = sqlite3.connect(self.db)
+        now = int(time.time() * 1000)
+        for sid, cwd in (('w1', ws), ('w2', ws / 'sub')):
+            con.execute('INSERT INTO sdk_sessions VALUES (?,?,?,?)', (sid, 'ws', str(cwd), now))
+            con.executemany('INSERT INTO observations VALUES (?,?,?,?)', [(sid, 'ws', 'discovery', now)] * 25)
+        con.commit(); con.close()
+        keys = {pp['suggested_key']: pp for pp in self.analysis()['projects']}
+        self.assertIn('ws', keys)
+        self.assertNotIn('sub', keys)
+        self.assertEqual(keys['ws']['obs_count'], 50)
 
     def test_apply_then_rollback_restores_bytes(self):
         ap = self.sbhome / 'config' / 'project_aliases.json'
@@ -356,6 +451,21 @@ class InstallerOnboardTests(VaultEnv):
         self.assertEqual(calls, ['init', 'analyze', 'plan'])
         self.assertEqual(envs[1].get('SB_VAULT_LLM'), 'off')
         self.assertTrue(any('sb vault apply' in str(c) for c in say.call_args_list))
+
+    def test_plan_failure_is_warning_without_apply_hint(self):
+        inst = self._inst()
+
+        def fake_run(cmd, check=True, capture=False, env=None, cwd=None):
+            if cmd[2] == 'analyze':
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({'data_volume': 'enough'}), '')
+            if cmd[2] == 'plan':
+                return subprocess.CompletedProcess(cmd, 1, '', 'boom')
+            return subprocess.CompletedProcess(cmd, 0, '', '')
+        with mock.patch.object(inst, 'run', fake_run), mock.patch.object(inst, 'say') as say, \
+                mock.patch.object(inst, 'WARNINGS', []) as w:
+            inst.vault_onboarding(self._args())
+        self.assertEqual(len(w), 1)
+        self.assertFalse(any('sb vault apply' in str(c) for c in say.call_args_list))
 
     def test_analyze_failure_is_warning(self):
         inst = self._inst()

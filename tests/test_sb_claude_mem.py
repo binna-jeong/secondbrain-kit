@@ -1,5 +1,6 @@
 """sb_claude_mem: claude-mem 버전·chroma-mcp 워커 인자 기준값과 worker-service.cjs 파서."""
 
+import json
 import os
 import sys
 import tempfile
@@ -85,8 +86,9 @@ class RequirementTests(unittest.TestCase):
 
 class VersionTests(unittest.TestCase):
     def test_vkey_and_range(self):
-        self.assertEqual(cm.vkey('13.34.2'), (13, 34, 2))
-        self.assertEqual(cm.vkey('v13.35.0-beta.1'), (13, 35, 0))
+        self.assertEqual(cm.vkey('13.34.2'), (13, 34, 2, 1))
+        self.assertEqual(cm.vkey('v13.35.0-beta.1'), (13, 35, 0, 0))
+        self.assertGreater(cm.vkey('13.34.2'), cm.vkey('13.34.2-beta'))   # 같은 숫자면 안정판이 높다
         self.assertEqual(cm.vkey('abc'), ())
         self.assertTrue(cm.in_tested(cm.RECOMMENDED))
         self.assertTrue(cm.in_tested(cm.TESTED[0]))
@@ -115,6 +117,49 @@ class VersionTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': tempfile.mkdtemp()}):
             self.assertIsNone(cm.plugin_root())
             self.assertFalse(cm.worker_chroma_spec()[2])
+
+class HardeningTests(unittest.TestCase):
+    """2026-11-15 GPT Pro 리뷰 P1-2·3·4·5 / P2-1·2 — 틀린 값을 성공으로 읽지 않는다."""
+    BASE = ('var BE=["onnxruntime>=1.20"],F0="0.2.6";class G{static buildLauncherPrefix(e){let r=BE.flatMap(n=>["--with",n]);'
+            'return["--python",e,...r,"--from",`chroma-mcp==${F0}`,"chroma-mcp"]}static z(){}}')
+
+    def test_duplicate_definition_fails_closed(self):
+        self.assertFalse(cm.parse_worker_spec('var BE=["evil"];' + self.BASE)[2])
+        self.assertFalse(cm.parse_worker_spec(self.BASE + 'var F0="9.9.9";')[2])
+
+    def test_two_methods_fail_closed(self):
+        self.assertFalse(cm.parse_worker_spec(self.BASE + self.BASE.replace('class G', 'class H'))[2])
+
+    def test_prerelease_version_kept_whole(self):
+        withs, ver, ok = cm.parse_worker_spec(self.BASE.replace('F0="0.2.6"', 'F0="0.2.6-beta.1"'))
+        self.assertTrue(ok)
+        self.assertEqual(ver, '0.2.6-beta.1')
+
+    def test_pydantic_requirement_must_actually_cap(self):
+        for worker in (['pydantic>=2.14'], ['pydantic==2.14'], ['pydantic'], ['pydantic>=2.0']):
+            self.assertIn(cm.PYDANTIC_PIN, cm.tool_requirements(worker), worker)
+        for worker in (['pydantic<2.14'], ['pydantic==2.13.5'], ['pydantic<2.13'], ['pydantic>=2,<2.14']):
+            self.assertEqual(cm.tool_requirements(worker), worker, worker)   # 이미 보장 — 더하지 않는다
+
+    def test_python_version_is_string(self):
+        os.environ.pop('CLAUDE_MEM_PYTHON_VERSION', None)
+        self.assertEqual(cm.python_version({'CLAUDE_MEM_PYTHON_VERSION': 3.12}), '3.12')
+
+    def test_chromadb_pin_normalized(self):
+        self.assertEqual(cm.pinned_chromadb(['chromadb == 1.5.9 ; python_version >= "3.12"']), '1.5.9')
+
+    def test_active_version_from_registry(self):
+        tmp = Path(tempfile.mkdtemp())
+        base = tmp / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem'
+        for v in ('13.34.2', '13.39.0'):
+            (base / v / 'scripts').mkdir(parents=True)
+            (base / v / 'scripts' / 'worker-service.cjs').write_text(fixture(v), encoding='utf-8')
+        (tmp / 'plugins' / 'installed_plugins.json').write_text(json.dumps({'version': 2, 'plugins': {
+            'claude-mem@thedotmack': [{'installPath': str(base / '13.34.2'), 'version': '13.34.2'}]}}), encoding='utf-8')
+        with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(tmp)}):
+            self.assertEqual(cm.plugin_root().name, '13.34.2')   # 캐시에 더 높은 판이 있어도 등록된 판
+            (tmp / 'plugins' / 'installed_plugins.json').unlink()
+            self.assertEqual(cm.plugin_root().name, '13.39.0')
 
 
 if __name__ == '__main__':

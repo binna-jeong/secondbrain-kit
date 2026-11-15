@@ -300,7 +300,7 @@ class ChromaPinTest(unittest.TestCase):
             self.assertEqual(sum(1 for w in tool_with if w.startswith('pydantic')), 1, version)
             self.assertEqual(args[-1], 'chroma-mcp==' + ver, version)
 
-    def test_pin_falls_back_and_warns_without_plugin(self):
+    def test_pin_uses_recommended_defaults_before_first_plugin_install(self):
         with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': tempfile.mkdtemp()}), \
                 mock.patch.object(inst, 'read_json', return_value={}), \
                 mock.patch.object(inst, 'run', return_value=subprocess.CompletedProcess([], 0)) as run, \
@@ -308,6 +308,19 @@ class ChromaPinTest(unittest.TestCase):
             inst.pin_chroma_mcp({'uv': 'uv'})
         argv = run.call_args[0][0]
         self.assertIn('chromadb==1.5.9', argv)   # 기본값 = 권장판 워커 인자
+        self.assertEqual(warnings, [])
+
+    def test_pin_skips_when_installed_worker_unreadable(self):
+        tmp = Path(tempfile.mkdtemp())
+        root = tmp / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem' / '13.99.0' / 'scripts'
+        root.mkdir(parents=True)
+        (root / 'worker-service.cjs').write_text('class A{static somethingElse(){}}', encoding='utf-8')
+        with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(tmp)}), \
+                mock.patch.object(inst, 'read_json', return_value={}), \
+                mock.patch.object(inst, 'run') as run, \
+                mock.patch.object(inst, 'WARNINGS', []) as warnings:
+            inst.pin_chroma_mcp({'uv': 'uv'})
+        run.assert_not_called()   # 어긋난 고정 도구를 깔지 않는다
         self.assertEqual(len(warnings), 1)
 
     def test_default_claude_mem_is_recommended(self):

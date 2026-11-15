@@ -41,7 +41,7 @@ IS_MAC = sys.platform == 'darwin'
 SB_HOME = Path(os.environ.get('SB_HOME') or HOME / '.secondbrain')
 VENV = SB_HOME / '.venv'
 VPY = VENV / ('Scripts/python.exe' if IS_WIN else 'bin/python')
-CM_DIR = HOME / '.claude-mem'
+CM_DIR = Path(os.environ.get('SB_CLAUDE_MEM_DIR') or HOME / '.claude-mem').expanduser()   # sb_config.claude_mem_dir 와 같은 규칙
 sys.path.insert(0, str(KIT / 'bin'))
 import sb_claude_mem  # noqa: E402  claude-mem 버전·chroma-mcp 워커 인자의 기준값(한 곳)
 
@@ -249,9 +249,12 @@ def pin_chroma_mcp(tools) -> None:
     끊기고 pydantic 최신판으로 죽는다. 같은 요구면 uv 가 건너뛰고, claude-mem 을 올린 뒤 다시 돌리면 도구를 고쳐 깐다."""
     args, ok = chroma_uvx_args()
     say('  chroma-mcp 고정 도구 (워커 인자 + %s)' % sb_claude_mem.PYDANTIC_PIN)
-    if not ok and not DRY:   # dry-run 은 claude-mem 을 실제로 깔지 않아 읽을 워커가 없다
-        WARNINGS.append('claude-mem 워커 인자를 읽지 못해 기본값(claude-mem %s 기준)으로 chroma-mcp 고정 도구를 깔았습니다 — '
-                        '--doctor 의 chroma-mcp 기동 확인' % sb_claude_mem.RECOMMENDED)
+    if not ok and sb_claude_mem.plugin_root() and not DRY:
+        # 설치된 워커가 있는데 인자를 못 읽었다(형식 변경). 기본값으로 깔면 워커 요구와 어긋난 도구가 남아
+        # 고쳤다는 착각만 준다 — 깔지 않고 알린다. 플러그인이 아직 없으면(첫 설치) 권장판 기본값으로 깐다.
+        WARNINGS.append('설치된 claude-mem 워커의 chroma-mcp 인자를 읽지 못해 고정 도구를 깔지 않았습니다 — '
+                        '--doctor 의 chroma-mcp 기동 확인, 키트 업데이트 필요할 수 있음')
+        return
     uv = tools.get('uv') or 'uv'
     r = run([uv, 'tool', 'install'] + args[:-2] + [args[-1]], check=False)
     if r.returncode != 0:
@@ -852,8 +855,11 @@ def vault_onboarding(args) -> None:
         say('  기록이 아직 적음(%s) — 기본 볼트로 시작. 기록이 쌓이면 세션 시작 때 `sb vault` 안내가 한 번 뜬다' % vol)
         return
     p = run([str(VPY), script, 'plan'], check=False, capture=True, env=env)
+    if p.returncode != 0:
+        WARNINGS.append('볼트 구성안 만들기 실패 — `sb vault plan`으로 다시 확인 (%s)' % ((p.stderr or '').strip().splitlines() or [''])[-1][:120])
+        return
     say(textwrap.indent((p.stdout or '').strip(), '  '))
-    say('  ▶ 위 구성안을 확인한 뒤 적용: 에이전트에게 "볼트 구성안 적용해 줘" 또는 `sb vault apply` (되돌리기 `sb vault rollback`)')
+    say('  ▶ 위 구성안을 확인한 뒤 적용: 에이전트에게 "볼트 구성안 적용해 줘" 또는 `sb vault apply --plan <위 저장 경로>` (되돌리기 `sb vault rollback`)')
 
 
 def uninstall() -> None:

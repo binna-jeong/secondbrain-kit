@@ -9,7 +9,7 @@
   sb vault init                              기본 볼트(기록이 없거나 적을 때). 이미 있으면 그대로
 
 원칙
-- 분석은 이 PC 안에서만 한다. 네트워크는 사용자가 설정한 LLM 주소(선택)뿐이고, SB_VAULT_LLM=off 면 쓰지 않는다.
+- 분석은 이 PC 안에서만 한다. LLM 은 기본으로 끄며, SB_VAULT_LLM=on 과 볼트 전용 주소(SB_VAULT_LLM_URL)를 둘 다 줄 때만 쓴다.
   LLM 에는 폴더 이름 조각만 보낸다(대화 내용·관측 본문은 보내지 않는다).
 - 분류 체계를 새로 만들지 않는다. 관측 type 분포와 폴더·git·자동 메모리 신호만 쓴다.
 - 적용은 기존 값을 덮어쓰지 않는다. 같은 키가 다른 값이면 기존 값을 두고 conflicts 로 보고한다.
@@ -17,6 +17,7 @@
 """
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -24,7 +25,9 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 import urllib.request
 from collections import defaultdict
 from contextlib import closing
@@ -97,11 +100,15 @@ def classify_path(p: str) -> str:
     for d in ('.claude', '.claude-mem', '.codex', '.gemini', '.omo', '.cache', 'Library'):
         if sb_scope.path_within(real, os.path.join(home, d)):
             return 'automation'
+    # 임시 폴더를 홈 판정보다 먼저 본다(%TEMP% 가 홈 아래인 윈도우). 단 홈 자체를 품은 임시 뿌리는 빼고 본다 —
+    # 홈이 임시 폴더 아래면(격리 시험·일회용 계정) 그 홈 아래 전부가 임시가 되어 버린다.
+    temp = [_norm(r) for r in sync_automemory.temp_roots()]
+    if any(sb_scope.path_within(real, r) and not sb_scope.path_within(home, r) for r in temp):
+        return 'temp'
     if sb_scope.path_within(real, home):
         return 'project'
-    if any(sb_scope.path_within(real, _norm(r)) for r in sync_automemory.temp_roots()):
-        return 'temp'
-    return 'automation'   # 홈 밖(시스템·다른 볼륨) — 보통 도구가 연 폴더다
+    # 홈 밖(다른 볼륨·D:\work 등)은 git 저장소일 때만 프로젝트로 본다 — 아니면 보통 도구가 연 폴더다
+    return 'project' if os.path.isdir(real) and git_root(real) else 'automation'
 
 
 def git_root(p: str) -> Optional[str]:
@@ -200,15 +207,11 @@ def analyze(db_path: Optional[str] = None, projects_root: Optional[str] = None, 
     cm = read_claude_mem(db_path)
     dirs = read_project_dirs(projects_root)
     aliases = sb_scope._load_aliases()
-    alias_paths = [(_norm(e), k) for k, v in aliases.items() for e in v if sb_scope.is_path_entry(e)]
 
     def alias_of(p: str) -> Optional[str]:
-        real = _norm(p)
-        best = None
-        for ap, k in alias_paths:
-            if sb_scope.path_within(real, ap) and (best is None or len(ap) > len(best[0])):
-                best = (ap, k)
-        return best[1] if best else None
+        # sb_scope 와 같은 규칙: 경로 별칭(가장 긴 상위) > 이름 별칭(경로 항목 없는 키, 하나만 맞을 때)
+        key, method, _ = sb_scope.resolve_scope_id(p, aliases=aliases, use_git=False)
+        return key if method in ('alias-path', 'alias-name') else None
 
     # 1) 작업 폴더별 집계
     folders: Dict[str, Dict[str, Any]] = defaultdict(lambda: {'obs': 0, 'sessions': 0, 'last': 0, 'tags': defaultdict(int),
@@ -273,10 +276,10 @@ def analyze(db_path: Optional[str] = None, projects_root: Optional[str] = None, 
         elif g and classify_path(g) == 'project':
             roots[p] = (g, 'git')
     project_folders = sorted((p for p in folders if classes[p] == 'project' and p not in roots), key=len)
-    for p in project_folders:
-        parent = next((r for r in project_folders if r != p and sb_scope.path_within(_norm(p), _norm(r))
-                       and r not in roots), None)
-        roots[p] = (roots[parent][0], 'parent') if parent and parent in roots else (p, 'folder')
+    for p in project_folders:   # 짧은 것(상위)부터 — 상위가 먼저 뿌리를 얻고, 하위는 가장 가까운 상위의 뿌리를 따른다
+        ancestors = [r for r in project_folders if r != p and r in roots and sb_scope.path_within(_norm(p), _norm(r))]
+        parent = max(ancestors, key=len) if ancestors else None
+        roots[p] = (roots[parent][0], 'parent') if parent else (p, 'folder')
 
     # 3) 뿌리별 후보
     groups: Dict[str, Dict[str, Any]] = {}
@@ -291,17 +294,28 @@ def analyze(db_path: Optional[str] = None, projects_root: Optional[str] = None, 
         for t, n in f['tags'].items():
             g['tags'][t] += n
         g['signals'] |= f['signals'] | {method}
-    taken: Dict[str, str] = {}
+    taken: Dict[str, str] = {k: next((os.path.expanduser(e) for e in v if sb_scope.is_path_entry(e)), '') or ('alias:' + k)
+                             for k, v in aliases.items()}   # 기존 별칭 키는 이미 쓰인 이름이다
     projects = []
     for root, g in sorted(groups.items(), key=lambda kv: -kv[1]['obs']):
         if root.startswith('alias:'):
             key = root.split(':', 1)[1]
-            real_root = next((e for e in aliases.get(key, []) if sb_scope.is_path_entry(e)), g['paths'][0])
+            # 기존 별칭 경로 중 지금 있는 폴더(없으면 실제로 관측된 가장 짧은 폴더) — 지워진 경로를 뿌리로 쓰지 않는다
+            live = [os.path.expanduser(e) for e in aliases.get(key, []) if sb_scope.is_path_entry(e)
+                    and os.path.isdir(os.path.expanduser(e))]
+            real_root = live[0] if live else sorted(g['paths'], key=len)[0]
             conf = 1.0
         else:
             real_root = root
             key = _suggest_key(root, taken)
             conf = 1.0 if 'git' in g['signals'] else 0.7
+        if root.startswith('alias:'):
+            pass
+        elif key in taken and taken[key] != real_root:   # 같은 이름 — 결정적인 꼬리 번호를 붙인다
+            n = 2
+            while '%s-%d' % (key, n) in taken:
+                n += 1
+            key = '%s-%d' % (key, n)
         taken.setdefault(key, real_root)
         projects.append({
             'scope_id': sb_scope.resolve_scope_id(real_root, use_git=use_git)[0] if os.path.isdir(real_root) else key,
@@ -321,7 +335,7 @@ def analyze(db_path: Optional[str] = None, projects_root: Optional[str] = None, 
     excluded.sort(key=lambda x: -x['obs_count'])
 
     llm_info = {'used': False, 'route': None, 'calls': 0}
-    if llm_mode(llm) != 'off':
+    if llm_mode(llm) == 'on':
         llm_info = refine_names(projects, llm)
 
     work_folders = sum(1 for p in projects if p['obs_count'] >= MIN_SCOPE_OBS or p['session_count'] >= MIN_SCOPE_SESSIONS)
@@ -352,18 +366,15 @@ def analyze(db_path: Optional[str] = None, projects_root: Optional[str] = None, 
 # ---------------------------------------------------------------- LLM(선택)
 
 def llm_mode(value: Optional[str] = None) -> str:
-    v = (value or os.environ.get('SB_VAULT_LLM') or 'auto').strip().lower()
-    return 'off' if v in ('off', '0', 'false', 'no') else 'auto'
+    """기본은 끔. SB_VAULT_LLM=on 일 때만 쓴다(폴더 이름도 업무 정보일 수 있어 명시적으로 켠다)."""
+    v = (value or os.environ.get('SB_VAULT_LLM') or 'off').strip().lower()
+    return 'on' if v in ('on', '1', 'true', 'yes') else 'off'
 
 
 def llm_route() -> Optional[Tuple[str, str, str]]:
-    """(url, model, key). 키트 공통 LLM 설정을 재사용한다: SB_VAULT_LLM_* > SB_CORRECTION_LLM_*."""
-    for prefix in ('SB_VAULT_LLM', 'SB_CORRECTION_LLM'):
-        url = os.environ.get(prefix + '_URL')
-        model = os.environ.get(prefix.replace('_LLM', '') + '_MODEL') or os.environ.get(prefix + '_MODEL')
-        if url and model:
-            return url, model, os.environ.get(prefix + '_KEY') or ''
-    return None
+    """(url, model, key). 볼트 전용 설정만 쓴다 — 다른 기능의 LLM 설정을 몰래 재사용하지 않는다."""
+    url, model = os.environ.get('SB_VAULT_LLM_URL'), os.environ.get('SB_VAULT_MODEL')
+    return (url, model, os.environ.get('SB_VAULT_LLM_KEY') or '') if url and model else None
 
 
 def needs_name(p: Dict[str, Any]) -> bool:
@@ -515,18 +526,70 @@ def render_plan(plan: Dict[str, Any]) -> str:
 
 def _sha(p: Path) -> Optional[str]:
     try:
-        return hashlib.sha256(p.read_bytes()).hexdigest()
+        return hashlib.sha256(Path(p).read_bytes()).hexdigest()
     except FileNotFoundError:
         return None
 
 
-def _atomic_write(p: Path, data: str) -> None:
-    # 심볼릭 링크(dotfiles 저장소로 연결한 settings.json 등)는 링크를 남기고 실제 파일을 바꾼다
-    p = Path(os.path.realpath(p)) if Path(p).is_symlink() else Path(p)
+def _real(p: Path) -> Path:
+    """쓰기 대상의 실제 파일. 심볼릭 링크(dotfiles 저장소로 연결한 settings.json 등)는 링크를 남기고 대상을 바꾼다."""
+    return Path(os.path.realpath(p)) if Path(p).is_symlink() else Path(p)
+
+
+def _atomic_write(p: Path, data: str, private: bool = False) -> None:
+    """같은 폴더의 고유 임시 파일(O_EXCL)에 쓰고 fsync 뒤 바꿔 끼운다. 기존 파일 권한은 유지한다."""
+    p = _real(p)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + '.sbvault-tmp')
-    tmp.write_text(data, encoding='utf-8')
-    os.replace(tmp, p)
+    try:
+        mode = p.stat().st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o600 if private else 0o644
+    fd, tmp = tempfile.mkstemp(prefix='.' + p.name + '.', suffix='.sbvault-tmp', dir=str(p.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class _Lock:
+    """볼트 적용·되돌리기를 한 번에 하나만 돌린다(같은 SB_HOME). 잡지 못하면 바로 실패한다."""
+
+    def __init__(self):
+        self.path = vault_dir() / '.apply.lock'
+        self.fd = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                age = time.time() - self.path.stat().st_mtime
+            except FileNotFoundError:
+                age = 0
+            if age < 600:
+                raise SystemExit('다른 sb vault 적용·되돌리기가 진행 중입니다(%s) — 끝난 뒤 다시 하세요' % _short(str(self.path)))
+            os.unlink(str(self.path))   # 10분 넘은 잠금은 죽은 프로세스의 흔적이다
+            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(self.fd, str(os.getpid()).encode())
+        return self
+
+    def __exit__(self, *a):
+        try:
+            os.close(self.fd)
+            os.unlink(str(self.path))
+        except OSError:
+            pass
+        return False
 
 
 def _targets(plan: Dict[str, Any]) -> Dict[str, Path]:
@@ -535,6 +598,20 @@ def _targets(plan: Dict[str, Any]) -> Dict[str, Path]:
     if plan.get('state_env'):
         t['settings'] = claude_settings_path()
     return t
+
+
+def _load_obj(p: Path, what: str) -> Dict[str, Any]:
+    """있으면 JSON 객체여야 한다. 없으면 {}. 깨졌거나 읽을 수 없으면 적용 전에 멈춘다(P0-1: 빈 객체로 덮지 않는다)."""
+    if not Path(p).exists():
+        return {}
+    try:
+        data = json.loads(Path(p).read_text(encoding='utf-8'))
+    except (OSError, ValueError) as e:
+        raise SystemExit('%s 를 읽을 수 없어 적용하지 않았습니다(%s: %s) — 파일을 고친 뒤 다시 하세요'
+                         % (what, _short(str(p)), type(e).__name__))
+    if not isinstance(data, dict):
+        raise SystemExit('%s 가 JSON 객체가 아니라 적용하지 않았습니다: %s' % (what, _short(str(p))))
+    return data
 
 
 def verify_applied(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -552,99 +629,162 @@ def verify_applied(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
     return checks
 
 
-def apply_plan(plan: Dict[str, Any], approved_hash: str, approved_by: str = 'user_cli',
-               _fail_after_write: bool = False) -> Dict[str, Any]:
+def _check_hash(plan: Dict[str, Any], approved_hash: str) -> None:
     if plan_hash(plan) != plan.get('plan_hash'):
         raise SystemExit('구성안 파일이 만든 뒤 바뀌었습니다(plan_hash 불일치) — sb vault plan 을 다시 돌리세요')
-    if not approved_hash or not plan['plan_hash'].startswith(approved_hash):
-        raise SystemExit('승인한 해시와 구성안이 다릅니다 — 요약을 다시 보고 --hash 로 승인하세요')
-    ts = stamp()
-    bdir = vault_dir() / 'backup' / ts
-    bdir.mkdir(parents=True, exist_ok=True)
+    h = (approved_hash or '').strip().lower()
+    if len(h) < 12 or not re.fullmatch(r'[0-9a-f]+', h) or not hmac.compare_digest(plan['plan_hash'][:len(h)], h):
+        raise SystemExit('승인한 해시와 구성안이 다릅니다(12자 이상) — 요약을 다시 보고 --hash 로 승인하세요')
+    keys = [sc['key'] for sc in plan.get('scopes', [])]
+    if len(keys) != len(set(keys)):
+        raise SystemExit('구성안에 같은 프로젝트 이름이 둘 이상 있어 적용하지 않았습니다 — sb vault plan 을 다시 돌리세요')
+
+
+def apply_plan(plan: Dict[str, Any], approved_hash: str, approved_by: str = 'user_cli',
+               _fail_after_write: bool = False) -> Dict[str, Any]:
+    _check_hash(plan, approved_hash)
     targets = _targets(plan)
-    record: Dict[str, Any] = {'version': SCHEMA, 'plan_hash': plan['plan_hash'], 'approved_by': approved_by,
-                              'applied_at': now_iso(), 'backups': [], 'writes': [], 'rolled_back': False}
-    for name, p in targets.items():
-        before = _sha(p)
-        bpath = None
-        if before is not None:
-            bpath = bdir / (name + '.bak')
-            shutil.copy2(p, bpath)
-        record['backups'].append({'target': str(p), 'backup_path': str(bpath) if bpath else None, 'sha256_before': before})
-    apply_path = vault_dir() / ('apply-%s.json' % ts)
-    try:
-        # 1) 별칭 병합 — 기존 키·경로는 건드리지 않는다
-        ap = targets['aliases']
-        cur = read_json_file(ap) if ap.exists() else {}
-        if not isinstance(cur, dict):
-            raise ValueError('별칭 파일이 JSON 객체가 아님: %s' % ap)
-        for k, v in plan['aliases'].items():
-            if k not in cur:
-                cur[k] = v
-        _atomic_write(ap, json.dumps(cur, ensure_ascii=False, indent=1) + '\n')
-        # 2) vault.json(정본)
-        _atomic_write(targets['vault_json'], json.dumps({
-            'version': SCHEMA,
-            'scopes': {s['key']: {'root': s['root'], 'state_write': s['state_write'], 'rules': s['rules'], 'loops': s['loops']}
-                       for s in plan['scopes']},
-            'kind_policy': plan['kind_policy'], 'state_write_mode': plan['state_write_mode'],
-            'scope_excluded': plan['scope_excluded'], 'updated_at': now_iso(), 'plan_hash': plan['plan_hash'],
-            'obs_seen': plan.get('obs_seen', 0),
-        }, ensure_ascii=False, indent=1) + '\n')
-        # 3) 미결 원장 — 없을 때만 빈 파일
-        if not targets['loops'].exists():
-            _atomic_write(targets['loops'], '')
-        # 4) 상태층 쓰기 허용 env — listed 모드이고 기존 값이 없을 때만(make_plan 이 충돌을 걸렀다)
-        if 'settings' in targets:
-            s = read_json_file(targets['settings']) or {}
-            env = s.setdefault('env', {})
-            if env.get(STATE_ENV) in (None, '', plan['state_env']):
-                env[STATE_ENV] = plan['state_env']
-            _atomic_write(targets['settings'], json.dumps(s, ensure_ascii=False, indent=2) + '\n')
+    with _Lock():
+        # 0) 쓰기 전 검증 — 깨진 설정이 하나라도 있으면 아무것도 쓰지 않는다
+        cur_aliases = _load_obj(targets['aliases'], '별칭 파일')
+        cur_settings = _load_obj(targets['settings'], 'Claude 설정') if 'settings' in targets else None
+        if cur_settings is not None and not isinstance(cur_settings.get('env', {}), dict):
+            raise SystemExit('Claude 설정의 env 가 객체가 아니라 적용하지 않았습니다')
+        aid = '%s-%s' % (stamp(), uuid.uuid4().hex[:8])
+        bdir = vault_dir() / 'backup' / aid
+        bdir.mkdir(parents=True, exist_ok=False)
+        os.chmod(bdir, 0o700)
+        apply_path = vault_dir() / ('apply-%s.json' % aid)
+        record: Dict[str, Any] = {'version': SCHEMA, 'id': aid, 'plan_hash': plan['plan_hash'], 'approved_by': approved_by,
+                                  'applied_at': now_iso(), 'backups': [], 'writes': [], 'rolled_back': False,
+                                  'state': 'prepared'}
         for name, p in targets.items():
-            record['writes'].append({'target': str(p), 'sha256_after': _sha(p)})
-        checks = verify_applied(plan)
-        if _fail_after_write:
-            checks.append({'check': 'forced_failure', 'ok': False})
-        record['verify'] = {'ok': all(c['ok'] for c in checks), 'checks': checks}
-    except Exception as e:  # noqa: BLE001
-        record['verify'] = {'ok': False, 'checks': [{'check': 'exception', 'ok': False, 'error': str(e)[:200]}]}
-    _atomic_write(apply_path, json.dumps(record, ensure_ascii=False, indent=1))
-    if not record['verify']['ok']:
-        rollback(apply_path, force=True)
-        record = read_json_file(apply_path)
+            real = _real(p)
+            before = _sha(real)
+            bpath = None
+            if before is not None:
+                bpath = bdir / (name + '.bak')
+                shutil.copy2(real, bpath)
+                os.chmod(bpath, 0o600)
+            record['backups'].append({'name': name, 'target': str(real), 'backup_path': str(bpath) if bpath else None,
+                                      'sha256_before': before})
+        # 1) 쓰기 전에 기록을 먼저 남긴다(write-ahead) — 쓰는 도중 죽어도 되돌릴 근거가 있다
+        _atomic_write(apply_path, json.dumps(record, ensure_ascii=False, indent=1), private=True)
+        before_map = {b['target']: b['sha256_before'] for b in record['backups']}
+
+        def guarded(name, data):
+            real = _real(targets[name])
+            if _sha(real) != before_map[str(real)]:   # P0-5: 백업 뒤 다른 프로세스가 고쳤다
+                raise RuntimeError('적용 중 %s 가 바뀌었다' % _short(str(real)))
+            _atomic_write(real, data)
+            record['writes'].append({'name': name, 'target': str(real), 'sha256_after': _sha(real)})
+
+        try:
+            for k, v in plan['aliases'].items():      # 별칭 병합 — 기존 키·경로는 건드리지 않는다
+                cur_aliases.setdefault(k, v)
+            guarded('aliases', json.dumps(cur_aliases, ensure_ascii=False, indent=1) + '\n')
+            guarded('vault_json', json.dumps({
+                'version': SCHEMA,
+                'scopes': {sc['key']: {'root': sc['root'], 'state_write': sc['state_write'], 'rules': sc['rules'],
+                                       'loops': sc['loops']} for sc in plan['scopes']},
+                'kind_policy': plan['kind_policy'], 'state_write_mode': plan['state_write_mode'],
+                'scope_excluded': plan['scope_excluded'], 'updated_at': now_iso(), 'plan_hash': plan['plan_hash'],
+                'obs_seen': plan.get('obs_seen', 0),
+            }, ensure_ascii=False, indent=1) + '\n')
+            if before_map[str(_real(targets['loops']))] is None:   # 미결 원장 — 없을 때만 빈 파일
+                guarded('loops', '')
+            if cur_settings is not None:              # listed 모드이고 기존 값이 없을 때만(make_plan 이 충돌을 걸렀다)
+                env = cur_settings.setdefault('env', {})
+                if env.get(STATE_ENV) in (None, '', plan['state_env']):
+                    env[STATE_ENV] = plan['state_env']
+                guarded('settings', json.dumps(cur_settings, ensure_ascii=False, indent=2) + '\n')
+            checks = verify_applied(plan)
+            if _fail_after_write:
+                checks.append({'check': 'forced_failure', 'ok': False})
+            record['verify'] = {'ok': all(c['ok'] for c in checks), 'checks': checks}
+        except Exception as e:  # noqa: BLE001
+            record['verify'] = {'ok': False, 'checks': [{'check': 'exception', 'ok': False, 'error': str(e)[:200]}]}
+        record['state'] = 'applied' if record['verify']['ok'] else 'failed'
+        try:
+            _atomic_write(apply_path, json.dumps(record, ensure_ascii=False, indent=1), private=True)
+        except Exception as e:  # noqa: BLE001 — 기록 저장 실패도 되돌린다(P0-4)
+            record['verify'] = {'ok': False, 'checks': [{'check': 'record_write', 'ok': False, 'error': str(e)[:200]}]}
+        if not record['verify']['ok']:
+            record = _restore(record, apply_path, only_ours=True)
     record['apply_path'] = str(apply_path)
     return record
 
 
 def latest(prefix: str) -> Optional[Path]:
-    files = sorted(vault_dir().glob(prefix + '-*.json'))
+    files = sorted(vault_dir().glob(prefix + '-*.json'), key=lambda p: p.stat().st_mtime)
     return files[-1] if files else None
+
+
+def _restore(rec: Dict[str, Any], apply_path: Path, only_ours: bool) -> Dict[str, Any]:
+    """기록의 백업으로 되돌린다. 대상마다 따로 시도해 끝까지 간다. only_ours 면 우리가 쓴 그대로인 파일만 되돌린다."""
+    after = {w['target']: w['sha256_after'] for w in rec.get('writes', [])}
+    restored = []
+    for b in rec['backups']:
+        target = Path(b['target'])
+        try:
+            cur = _sha(target)
+            if cur == b['sha256_before']:
+                restored.append({'target': b['target'], 'ok': True, 'note': 'unchanged'})
+                continue
+            if only_ours and b['target'] in after and cur != after[b['target']]:
+                restored.append({'target': b['target'], 'ok': False, 'note': 'changed_by_other'})
+                continue
+            if b['target'] not in after and only_ours:
+                restored.append({'target': b['target'], 'ok': False, 'note': 'not_written_but_changed'})
+                continue
+            if b['backup_path']:
+                _atomic_write(target, Path(b['backup_path']).read_text(encoding='utf-8'))
+            elif target.exists():
+                target.unlink()     # 적용이 새로 만든 파일 — 지금 내용이 우리가 쓴 그대로일 때만 여기 온다
+            restored.append({'target': b['target'], 'ok': _sha(target) == b['sha256_before']})
+        except Exception as e:  # noqa: BLE001
+            restored.append({'target': b['target'], 'ok': False, 'error': str(e)[:160]})
+    rec['rolled_back'] = True
+    rec['state'] = 'rolled_back'
+    rec['rollback'] = {'at': now_iso(), 'restored': restored, 'ok': all(r['ok'] for r in restored)}
+    try:
+        _atomic_write(apply_path, json.dumps(rec, ensure_ascii=False, indent=1), private=True)
+    except Exception:  # noqa: BLE001
+        pass
+    return rec
+
+
+def _validate_record(rec: Any, apply_path: Path) -> Dict[str, Any]:
+    """--apply 로 받은 기록은 이 볼트가 만든 것이고 대상이 볼트 대상 파일뿐인지 확인한다(P0-2)."""
+    if not isinstance(rec, dict) or not isinstance(rec.get('backups'), list):
+        raise SystemExit('적용 기록 형식이 아닙니다: %s' % apply_path)
+    if Path(os.path.realpath(apply_path)).parent != Path(os.path.realpath(vault_dir())):
+        raise SystemExit('이 볼트의 적용 기록이 아닙니다: %s' % apply_path)
+    allowed = {str(_real(p)) for p in (vault_json_path(), loops_path(), claude_settings_path(), Path(sb_scope.aliases_path()))}
+    bdir = os.path.realpath(vault_dir() / 'backup')
+    for b in rec['backups']:
+        if b.get('name') == 'aliases':
+            allowed.add(b['target'])   # 구성안이 지정한 별칭 파일(aliases_path)
+        if b['target'] not in allowed:
+            raise SystemExit('적용 기록에 볼트 밖 대상이 있어 되돌리지 않았습니다: %s' % b['target'])
+        if b.get('backup_path') and not os.path.realpath(b['backup_path']).startswith(bdir + os.sep):
+            raise SystemExit('적용 기록의 백업 경로가 볼트 밖입니다: %s' % b['backup_path'])
+    return rec
 
 
 def rollback(apply_path: Optional[Path] = None, force: bool = False) -> Dict[str, Any]:
     apply_path = Path(apply_path) if apply_path else latest('apply')
     if not apply_path or not apply_path.exists():
         raise SystemExit('되돌릴 적용 기록이 없습니다')
-    rec = read_json_file(apply_path)
-    if rec.get('rolled_back'):
-        raise SystemExit('이미 되돌린 적용입니다: %s' % apply_path)
-    after = {w['target']: w['sha256_after'] for w in rec.get('writes', [])}
-    changed = [t for t, h in after.items() if _sha(Path(t)) != h]
-    if changed and not force:   # 적용 뒤 사용자·다른 도구가 고친 파일을 되돌리기로 덮지 않는다
-        raise SystemExit('적용 뒤 바뀐 파일이 있어 되돌리지 않았습니다(--force 로 강제): ' + ', '.join(_short(c) for c in changed))
-    restored = []
-    for b in rec['backups']:
-        target = Path(b['target'])
-        if b['backup_path']:
-            _atomic_write(target, Path(b['backup_path']).read_text(encoding='utf-8'))
-        elif target.exists():
-            target.unlink()
-        restored.append({'target': b['target'], 'ok': _sha(target) == b['sha256_before']})
-    rec['rolled_back'] = True
-    rec['rollback'] = {'at': now_iso(), 'restored': restored, 'ok': all(r['ok'] for r in restored)}
-    _atomic_write(apply_path, json.dumps(rec, ensure_ascii=False, indent=1))
-    return rec
+    with _Lock():
+        rec = _validate_record(read_json_file(apply_path), apply_path)
+        if rec.get('rolled_back'):
+            raise SystemExit('이미 되돌린 적용입니다: %s' % apply_path)
+        after = {w['target']: w['sha256_after'] for w in rec.get('writes', [])}
+        changed = [t for t, h in after.items() if _sha(Path(t)) != h]
+        if changed and not force:   # 적용 뒤 사용자·다른 도구가 고친 파일을 되돌리기로 덮지 않는다
+            raise SystemExit('적용 뒤 바뀐 파일이 있어 되돌리지 않았습니다(--force 로 강제): ' + ', '.join(_short(c) for c in changed))
+        return _restore(rec, apply_path, only_ours=not force)
 
 
 def status() -> Dict[str, Any]:
@@ -667,9 +807,10 @@ NUDGE_MIN_NEW = 2000        # 그리고 최소 이만큼은 늘어야 한다(작
 
 
 def _max_obs_id(db) -> int:
+    """관측 id 의 최댓값(정수 기본키라 인덱스로 바로 읽힌다). 관측 수의 근사값으로 쓴다."""
     try:
         return int(db.execute('SELECT MAX(id) FROM observations').fetchone()[0] or 0)
-    except sqlite3.Error:
+    except (sqlite3.Error, ValueError, TypeError):
         return 0
 
 
@@ -705,10 +846,10 @@ def nudge_line(today: Optional[str] = None, db_path: Optional[str] = None) -> st
     db_path = db_path or sb_config.claude_mem_db()
     if not Path(db_path).is_file():
         return ''
-    try:
-        with closing(_ro(db_path)) as db:
+    try:   # 세션 시작 훅에서 돈다 — DB 가 잠겨 있으면 기다리지 않고 건너뛴다
+        with closing(sqlite3.connect('file:%s?mode=ro' % Path(db_path).as_posix(), uri=True, timeout=0.2)) as db:
             now_obs = _max_obs_id(db)
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError, ValueError, TypeError):
         return ''
     v = read_json_file(vault_json_path())
     msg = ''
@@ -716,7 +857,10 @@ def nudge_line(today: Optional[str] = None, db_path: Optional[str] = None) -> st
         if now_obs >= ENOUGH_OBS:
             msg = '볼트가 아직 기본 상태다 — 기록 %d건이 쌓였으니 `sb vault analyze` → `sb vault plan`으로 프로젝트·레이어 구성안을 만들어 사용자에게 보여 줄 수 있다' % now_obs
     else:
-        seen = int(v.get('obs_seen') or 0)
+        try:
+            seen = int(v.get('obs_seen') or 0)
+        except (TypeError, ValueError):
+            seen = 0
         if seen and now_obs >= seen * NUDGE_GROWTH and now_obs - seen >= NUDGE_MIN_NEW:
             msg = '볼트 구성 뒤 기록이 %d건 → %d건으로 늘었다 — `sb vault analyze`·`plan`으로 새 프로젝트를 확인할 수 있다' % (seen, now_obs)
     if msg:
@@ -730,8 +874,12 @@ def nudge_line(today: Optional[str] = None, db_path: Optional[str] = None) -> st
 # ---------------------------------------------------------------- CLI
 
 def _save(prefix: str, data: Dict[str, Any]) -> Path:
-    p = vault_dir() / ('%s-%s.json' % (prefix, stamp()))
-    _atomic_write(p, json.dumps(data, ensure_ascii=False, indent=1))
+    p = vault_dir() / ('%s-%s-%s.json' % (prefix, stamp(), uuid.uuid4().hex[:6]))
+    _atomic_write(p, json.dumps(data, ensure_ascii=False, indent=1), private=True)   # 경로·꼬리표가 들어 있어 본인만 읽게
+    try:
+        os.chmod(vault_dir(), 0o700)
+    except OSError:
+        pass
     return p
 
 

@@ -36,28 +36,56 @@ DEFAULT_PYTHON = '3.13'
 
 
 def vkey(v: str) -> Tuple[int, ...]:
-    """'13.34.2' → (13, 34, 2). 숫자가 아닌 꼬리(-beta 등)는 버린다. 못 읽으면 ()."""
+    """'13.34.2' → (13, 34, 2, 1). 끝 자리는 안정판 1, 사전판(-beta 등) 0 — 같은 숫자면 안정판이 높다. 못 읽으면 ()."""
+    raw = str(v).strip().lstrip('v')
+    base = re.split(r'[-+]', raw)[0]
     try:
-        return tuple(int(x) for x in re.split(r'[-+]', str(v).strip().lstrip('v'))[0].split('.'))
+        nums = tuple(int(x) for x in base.split('.'))
     except ValueError:
         return ()
+    return nums + (0 if '-' in raw else 1,)
 
 
 def in_tested(v: Optional[str]) -> bool:
     k = vkey(v or '')
-    return bool(k) and vkey(TESTED[0]) <= k <= vkey(TESTED[1])
+    return bool(k) and vkey(TESTED[0])[:-1] <= k[:-1] <= vkey(TESTED[1])[:-1]
 
 
 def plugin_base() -> Path:
     return Path(os.environ.get('CLAUDE_CONFIG_DIR') or '~/.claude').expanduser() / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem'
 
 
+def _usable(d: Path) -> bool:
+    return d.is_dir() and not (d / '.orphaned_at').exists() and (d / 'scripts' / 'worker-service.cjs').is_file()
+
+
+def active_root() -> Optional[Path]:
+    """Claude Code 플러그인 등록(installed_plugins.json)이 가리키는 claude-mem 설치 경로. 없거나 못 쓰면 None."""
+    reg = plugin_base().parents[2] / 'installed_plugins.json'
+    try:
+        data = json.loads(reg.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    for key, entries in (data.get('plugins') or {}).items():
+        if not str(key).startswith('claude-mem@'):
+            continue
+        for e in entries if isinstance(entries, list) else [entries]:
+            p = Path(str((e or {}).get('installPath') or '')).expanduser()
+            if p.name and _usable(p):
+                return p
+    return None
+
+
 def plugin_root() -> Optional[Path]:
-    """설치된 claude-mem 플러그인 중 가장 높은 버전(고아 표시·scripts 없는 폴더 제외)."""
+    """실제로 쓰이는 claude-mem 플러그인 폴더. 등록 정보가 가리키는 판이 먼저이고, 없으면 캐시에서 가장 높은
+    판(고아 표시·scripts 없는 폴더 제외, 같은 숫자면 안정판)."""
+    act = active_root()
+    if act:
+        return act
     base = plugin_base()
     best = None
-    for d in base.glob('*') if base.is_dir() else []:
-        if (d / '.orphaned_at').exists() or not (d / 'scripts' / 'worker-service.cjs').is_file():
+    for d in sorted(base.glob('*')) if base.is_dir() else []:
+        if not _usable(d):
             continue
         key = vkey(d.name)
         if not key:
@@ -72,41 +100,47 @@ def installed_version(root: Optional[Path] = None) -> Optional[str]:
     return root.name if root else None
 
 
-_PREFIX = re.compile(r'buildLauncherPrefix\(\w+\)\{(.{0,600}?)\}(?=static\b|\}|$)', re.S)
+_PREFIX = re.compile(r'static buildLauncherPrefix\(\w+\)\{(.{0,1200}?)\}(?=static\b|\}|$)', re.S)
+_VER = r'([0-9]+(?:\.[0-9]+)*(?:[-+.][0-9A-Za-z.]+)?)'
 
 
-def _string_def(text: str, name: str) -> Optional[str]:
-    m = re.search(r'(?<![\w$.])' + re.escape(name) + r'="([^"\\]*)"', text)
-    return m.group(1) if m else None
-
-
-def _array_def(text: str, name: str) -> Optional[List[str]]:
-    m = re.search(r'(?<![\w$.])' + re.escape(name) + r'=\[((?:"[^"\\]*",?)*)\]', text)
-    return re.findall(r'"([^"\\]*)"', m.group(1)) if m else None
+def _defs(text: str, name: str, pattern: str) -> List[str]:
+    return re.findall(r'(?<![\w$.])' + re.escape(name) + pattern, text)
 
 
 def parse_worker_spec(text: str) -> Tuple[List[str], str, bool]:
-    """worker-service.cjs 본문에서 (워커 --with 목록, chroma-mcp 버전, 읽기 성공)."""
-    m = _PREFIX.search(text or '')
-    if not m:
-        return list(FALLBACK_WITH), FALLBACK_CHROMA_MCP, False
-    body = m.group(1)
-    ver = None
+    """worker-service.cjs 본문에서 (워커 --with 목록, chroma-mcp 버전, 읽기 성공).
+    모호하면(메서드가 둘 이상, 변수 정의가 둘 이상, 정의를 못 찾음) 기본값과 False — 틀린 값을 성공으로 내지 않는다.
+    npm 18개 판(13.24.23~15.18.3) 모두 메서드 1개·정의 1개씩이었다(2026-11-15 실측)."""
+    fail = (list(FALLBACK_WITH), FALLBACK_CHROMA_MCP, False)
+    text = text or ''
+    found = _PREFIX.findall(text)
+    if len(found) != 1:
+        return fail
+    body = found[0]
     vm = re.search(r'chroma-mcp==\$\{([\w$]+)\}', body)
     if vm:
-        ver = _string_def(text, vm.group(1))
+        vals = _defs(text, vm.group(1), r'="' + _VER + '"')
+        if len(_defs(text, vm.group(1), r'=')) != 1 or len(vals) != 1:
+            return fail
+        ver = vals[0]
     else:
-        lm = re.search(r'chroma-mcp==([0-9][\w.]*)', body)
-        ver = lm.group(1) if lm else None
-    withs = None
+        lm = re.search(r'chroma-mcp==' + _VER + r'["`]', body)
+        if not lm:
+            return fail
+        ver = lm.group(1)
     fm = re.search(r'([\w$]+)\.flatMap\(', body)
     if fm:
-        withs = _array_def(text, fm.group(1))
+        arrs = _defs(text, fm.group(1), r'=\[((?:"[^"\\]*",?)*)\]')
+        if len(_defs(text, fm.group(1), r'=')) != 1 or len(arrs) != 1:
+            return fail
+        withs = re.findall(r'"([^"\\]*)"', arrs[0])
     else:
-        found = re.findall(r'"--with","([^"\\]*)"', body)
-        withs = found if found else None
-    if not ver or withs is None or not vkey(ver):
-        return list(FALLBACK_WITH), FALLBACK_CHROMA_MCP, False
+        withs = re.findall(r'"--with","([^"\\]*)"', body)
+        if not withs:
+            return fail
+    if not vkey(ver):
+        return fail
     return withs, ver, True
 
 
@@ -125,7 +159,8 @@ def worker_chroma_spec(root: Optional[Path] = None) -> Tuple[List[str], str, boo
 def python_version(settings: Optional[dict] = None) -> str:
     """워커가 쓰는 파이썬 버전 — 워커와 같은 규칙(환경변수 > claude-mem 설정 > 3.13)."""
     s = settings or {}
-    return os.environ.get('CLAUDE_MEM_PYTHON_VERSION') or s.get('CLAUDE_MEM_PYTHON_VERSION') or DEFAULT_PYTHON
+    v = os.environ.get('CLAUDE_MEM_PYTHON_VERSION') or s.get('CLAUDE_MEM_PYTHON_VERSION') or DEFAULT_PYTHON
+    return str(v).strip() or DEFAULT_PYTHON   # 설정 JSON 의 숫자(3.12)도 문자열로
 
 
 def worker_args(withs: List[str], chroma_ver: str) -> List[str]:
@@ -136,19 +171,36 @@ def worker_args(withs: List[str], chroma_ver: str) -> List[str]:
     return out + ['--from', 'chroma-mcp==%s' % chroma_ver, 'chroma-mcp']
 
 
+def _pydantic_safe(req: str) -> bool:
+    """이 요구 하나만으로 pydantic 2.14 미만이 보장되는가(보수적으로 해석 — 모르면 False)."""
+    r = re.sub(r'\s+', '', req.split(';')[0])
+    m = re.match(r'pydantic(?:\[[^\]]*\])?(.*)$', r, re.I)
+    if not m:
+        return False
+    for spec in m.group(1).split(','):
+        mm = re.match(r'(<=|<|==|~=)(\d+)\.(\d+)', spec)
+        if not mm:
+            continue
+        major, minor = int(mm.group(2)), int(mm.group(3))
+        if major < 2 or (major == 2 and (minor < 14 if mm.group(1) != '<' else minor <= 14)):
+            return True
+    return False
+
+
 def tool_requirements(withs: List[str]) -> List[str]:
-    """고정 도구에 넣을 요구 = 워커 요구 전부 + pydantic 고정(워커가 이미 pydantic 을 고정하면 더하지 않는다).
+    """고정 도구에 넣을 요구 = 워커 요구 전부 + pydantic 고정(워커 요구가 이미 2.14 미만을 보장할 때만 생략).
     uvx 는 이름이 같은 도구가 워커의 모든 --with 를 이미 만족할 때만 그 도구를 재사용한다(2026-11-15 격리 실측).
-    하나라도 빠지면 경고 없이 새 환경을 풀고 pydantic 최신판을 받는다."""
+    하나라도 빠지면 경고 없이 새 환경을 풀고 pydantic 최신판을 받는다. 워커가 pydantic>=2.14 를 요구하면
+    두 요구가 충돌해 uv tool install 이 실패하고, 설치기는 경고를 남긴다."""
     reqs = list(withs)
-    if not any(re.match(r'pydantic\b', w) for w in reqs):
+    if not any(_pydantic_safe(w) for w in reqs):
         reqs.append(PYDANTIC_PIN)
     return reqs
 
 
 def pinned_chromadb(withs: List[str]) -> Optional[str]:
     for w in withs:
-        m = re.match(r'chromadb==([\w.]+)$', w)
+        m = re.match(r'chromadb==([\w.+-]+)$', re.sub(r'\s+', '', w.split(';')[0]))
         if m:
             return m.group(1)
     return None
