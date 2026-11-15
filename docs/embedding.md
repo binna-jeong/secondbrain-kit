@@ -38,7 +38,8 @@ claude-mem은 벡터 컬렉션(`cm__claude-mem`)을 만들 때 임베딩을 지�
 
 ## chroma-mcp 버전 고정
 - 2026-10-12, uvx가 chroma-mcp 환경을 새로 풀면서 pydantic 2.14.1을 받았다. chroma-mcp 0.2.6이 고정한 mcp 1.6.0은 2.14에서 사라진 `pydantic._internal._typing_extra.eval_type_backport`를 import해 시작하자마자 죽었고, 벡터 동기화가 4시간 넘게 멈췄다. 2026-10-30에 고정 없이 다시 띄워도 같은 ImportError가 났다.
-- claude-mem 워커는 자기 인자(`uvx --python 3.13 --with onnxruntime>=1.20 --with protobuf<7 --from chroma-mcp==0.2.6 chroma-mcp`)로 chroma-mcp를 띄우므로, 설치기가 자기 명령에 붙인 고정은 워커에 닿지 않는다. 그래서 설치기는 같은 인자에 `--with "pydantic<2.14"`를 더해 `uv tool install`로 도구를 깔아 둔다. uvx는 요구를 만족하는 설치 도구가 있으면 새로 풀지 않고 그 환경을 쓴다(uv 0.10 실측).
+- claude-mem 워커는 자기 인자(`uvx --python <버전> --with … --from chroma-mcp==<버전> chroma-mcp`, worker-service.cjs의 `buildLauncherPrefix`)로 chroma-mcp를 띄우므로, 설치기가 자기 명령에 붙인 고정은 워커에 닿지 않는다. 그래서 설치기는 **설치된 워커의 인자를 읽어** 그 요구 전부에 `pydantic<2.14`를 더해 `uv tool install`로 도구를 깔아 둔다. uvx는 같은 이름의 도구가 워커의 `--python`과 모든 `--with`를 이미 만족할 때만 새로 풀지 않고 그 환경을 쓴다(uv 0.10 격리 실측). 하나라도 빠지면 경고 없이 새 환경을 풀고 pydantic 최신판을 받는다.
+- 워커 인자는 claude-mem 버전마다 다르다: 13.24~13.28은 onnxruntime·protobuf, 13.29부터 `chromadb==` 고정이 추가되고, 13.35부터는 본가가 `pydantic<2.14`까지 직접 고정한다. 기준값(권장판·키트 검증 범위·기본 인자)은 `bin/sb_claude_mem.py` 한 곳에 있고, `python bin/sb_claude_mem.py`가 이 PC의 설치판·워커 인자·고정 도구 요구를 보여 준다.
 - 확인: `./install.sh --doctor`의 `chroma-mcp 기동`이 워커와 같은 인자로 실제로 띄워 본다. ❌에 ImportError가 보이면 설치기를 다시 돌린다. 밀린 벡터는 원인을 없앤 뒤 claude-mem 워커가 다시 떠야 채워진다(`sb health`의 chroma-pending).
-- 한계: claude-mem을 올려 워커의 `--with` 목록이나 파이썬 버전이 설치 도구와 달라지면 uvx가 다시 풀어 고정이 빠질 수 있다. 이 경우는 doctor의 기동 점검으로만 잡힌다.
+- claude-mem을 올린 뒤에는 설치기를 한 번 다시 돌린다. 워커 인자가 바뀌었으면 uv가 도구를 고쳐 깔고, 같으면 건너뛴다. doctor는 설치판이 키트 검증 범위 밖이거나 워커의 `chromadb==`가 키트 venv와 다르면 ⚠로 알린다(차단하지 않는다). 워커 인자를 못 읽으면(파일 형식 변경) 설치기는 기본값으로 깔고 경고를 남기며, doctor의 기동 점검이 ⚠로 표시한다.
 - 이 도구는 claude-mem 워커가 쓰므로 키트를 제거해도 남긴다. claude-mem까지 지운 뒤에 `uv tool uninstall chroma-mcp`로 지운다.

@@ -58,7 +58,7 @@ irm https://raw.githubusercontent.com/fivetaku/secondbrain-kit/main/bootstrap.ps
 
 설치가 하는 일 (모두 멱등, 바꾸는 설정 파일은 `.sbkit-bak-<시각>`으로 백업):
 1. `~/.secondbrain/.venv` 생성, 상태층 DB 초기화
-2. `npx claude-mem install` — Claude Code 플러그인 등록, bun/uv 설치. 이어서 chroma-mcp 고정 도구 설치(`uv tool install … --with "pydantic<2.14" chroma-mcp==0.2.6`) — 2026-10-12에 uvx가 pydantic 2.14를 받아 오자 chroma-mcp 0.2.6이 시작하자마자 ImportError로 죽고 벡터 동기화가 4시간 넘게 멈췄다. claude-mem 워커는 자기 인자로 chroma-mcp를 띄우지만, 조건에 맞는 설치 도구가 있으면 uvx가 그것을 다시 쓰므로 고정이 워커에도 걸린다([docs/embedding.md](docs/embedding.md#chroma-mcp-버전-고정))
+2. `npx claude-mem@<권장판> install`(권장판은 `bin/sb_claude_mem.py`의 `RECOMMENDED`, `SBKIT_CLAUDE_MEM_VERSION`으로 바꿀 수 있다) — Claude Code 플러그인 등록, bun/uv 설치. 이어서 chroma-mcp 고정 도구 설치(설치된 워커의 인자 + `pydantic<2.14`로 `uv tool install`, 기준값은 `bin/sb_claude_mem.py`) — 2026-10-12에 uvx가 pydantic 2.14를 받아 오자 chroma-mcp 0.2.6이 시작하자마자 ImportError로 죽고 벡터 동기화가 4시간 넘게 멈췄다. claude-mem 워커는 자기 인자로 chroma-mcp를 띄우지만, 조건에 맞는 설치 도구가 있으면 uvx가 그것을 다시 쓰므로 고정이 워커에도 걸린다([docs/embedding.md](docs/embedding.md#chroma-mcp-버전-고정))
 3. BGE-m3-ko GGUF를 받아 Ollama `bge-m3-ko` 생성(실패 시 `bge-m3`), Chroma 컬렉션을 한국어 임베딩으로 선생성, `~/.chroma_env`
 4. claude-mem 설정(한국어 관측 모드, 주입량) — 이미 있는 값은 건드리지 않음
 5. Claude Code 훅 6종 (`~/.claude/settings.json`, 기존 훅은 보존): SessionStart · UserPromptSubmit · PreToolUse(AskUserQuestion) · Stop · SubagentStart · PostToolUseFailure. PostToolUseFailure(오류 시점 회수)는 Claude Code 2.1.119 이상에서만 걸고, 그보다 낮으면 5종이다 — 2.1.101 이전 버전은 모르는 이벤트가 하나라도 있으면 settings.json 전체를 무시하기 때문이다. 같은 역할의 사용자 훅이 이미 있으면 그 이벤트는 건너뛴다
@@ -88,6 +88,25 @@ sb health [--fix]                   # 기록층이 막힌 곳이 없는지 점�
 ```
 
 에이전트는 규칙 블록을 보고 이 명령들을 스스로 쓴다. 사람이 직접 칠 일은 드물다.
+
+## 볼트 구성 (`sb vault`)
+
+설치기는 적재(캡처·임베딩·훅·회수 서버)만이 아니라 볼트도 만든다. 볼트는 기록을 프로젝트(scope)별로 나누고, 레이어마다 어느 프로젝트를 다룰지 정한 구성이다. 정본은 `~/.secondbrain/config/vault.json` 한 파일이다.
+
+- 설치기 11단계(`--no-vault`로 끔)
+  - `sb vault init`으로 기본 볼트를 만든다. 이미 있으면 그대로 둔다.
+  - `sb vault analyze`로 이 PC의 기록을 읽는다(읽기 전용).
+  - 기록이 충분하면 `sb vault plan`의 구성안 요약을 보여 준다. **적용은 하지 않는다.**
+- 분석 대상: claude-mem 세션의 작업 폴더, 관측 꼬리표, git 최상위, Claude Code 자동 메모리. 이걸로 프로젝트 후보·별칭·상태층 쓰기 대상·규칙층 대상을 뽑는다. 홈·임시·에이전트 내부 폴더는 scope로 제안하지 않는다.
+- LLM(선택): `SB_VAULT_LLM_URL`·`SB_VAULT_MODEL`(없으면 교정 감지 설정)을 쓴다. 폴더 이름이 흔해서(`src`, `app` 등) 이름을 정하기 애매한 후보만 묻고, 폴더 이름 조각만 보낸다. `SB_VAULT_LLM=off`면 쓰지 않는다.
+- 적용: `sb vault apply`는 요약을 보여 주고 `yes`를 받는다. 에이전트는 `sb vault apply --plan <파일> --yes --hash <앞 12자>`를 쓰며, 사용자가 본 해시와 같을 때만 적용된다.
+  - 순서: 백업 → 병합 쓰기 → 검증 → 실패 시 자동 되돌리기
+  - 기존 별칭과 `SB_STATE_PILOT_SCOPES`는 덮어쓰지 않고, 다른 값이면 충돌로 보고만 한다.
+  - claude-mem 수집 제외는 바꾸지 않는다.
+- 되돌리기: `sb vault rollback`. 적용 뒤 사용자가 고친 파일이 있으면 멈추고, `--force`로 강제한다.
+- 상태층 쓰기 대상: 기본(`--state-write all`)은 env를 바꾸지 않는다(전 scope 허용). `--state-write listed`면 최근 30일 활동이 있는 scope만 허용하는 목록을 만든다.
+- 재분석 알림: 기본 볼트인데 관측이 500건을 넘었거나, 구성 뒤 기록이 1.5배·2,000건 이상 늘면 세션 시작에 한 줄 뜬다. 하루 1회 이하이고 `SB_VAULT_NUDGE=0`으로 끈다.
+- 현재 상태: `sb vault status`.
 
 ## 기록층 감시 (`sb health`)
 
@@ -194,6 +213,9 @@ Claude Code에서 도구 호출이 실패하면(PostToolUseFailure, Claude Code 
 | **기타** | | |
 | `SB_RULES_DIR` | `$SB_HOME/rules` | 규칙층 폴더(`sb rules`가 쓰고 `sb search --mode rules`가 읽는다) |
 | `SB_PROJECT_ALIASES` | `$SB_HOME/config/project_aliases.json` | scope 별칭 파일 위치 |
+| `SB_VAULT_LLM` | `auto` | `off`면 `sb vault analyze`가 LLM을 쓰지 않는다(경로 설정이 없어도 쓰지 않는다) |
+| `SB_VAULT_LLM_URL`, `SB_VAULT_MODEL`, `SB_VAULT_LLM_KEY` | 없음 | 볼트 분석의 이름 다듬기 LLM(OpenAI 호환). 없으면 교정 감지 설정을 쓴다 |
+| `SB_VAULT_NUDGE` | `1` | `0`이면 세션 시작의 볼트 재분석 알림을 끈다 |
 | `SB_OLLAMA_URL` | `http://127.0.0.1:11434` | 기록층 감시가 확인하는 Ollama 주소 |
 | `SB_RELABEL_KEEP` | `5` | 재분류할 때 만드는 DB 백업의 보존 개수 |
 | `SB_SAVE_ALLOW_EXCLUDED` | 없음 | `1`이면 수집 제외 프로젝트에도 `sb save`를 허용한다(기본은 차단) |

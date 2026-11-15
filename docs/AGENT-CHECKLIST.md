@@ -61,13 +61,21 @@
 - [ ] **D-6 교정 감지(선택)**: 기본은 꺼져 있다(판정 LLM 설정이 없으면 아무것도 하지 않는다). 사용자가 원할 때만 README "교정 감지" 절차로 `~/.secondbrain/index/correction_llm.json`을 만들게 한다 — 키는 사용자가 직접 넣는다
 - [ ] **D-7 스케줄**: 맥 `launchctl list | grep secondbrain-kit` (koindex·nightly), 윈도우 `schtasks /Query /TN "secondbrain-kit\nightly"`
 
+## D+. 볼트 구성 (설치 직후, 사용자 확인 필요)
+
+- [ ] **V-1 상태**: `sb vault status` → `볼트: 구성됨`, 또는 기본 볼트(`default`)인지
+- [ ] **V-2 구성안**: 설치 로그에 구성안 요약이 나왔으면(기록 충분), 그 요약을 **그대로 사용자에게 보여 주고** 적용 여부를 묻는다. 요약 없이 적용하지 않는다
+- [ ] **V-3 적용**: 사용자가 승인하면 `sb vault apply --plan <파일> --yes --hash <요약의 해시>` → `적용 완료`와 되돌리기 명령을 사용자에게 전달
+- [ ] **V-4 충돌**: 요약의 `충돌` 줄은 기존 값을 유지한 것이다. 바꾸려면 사용자가 직접 정한다(에이전트가 덮어쓰지 않는다)
+- [ ] **V-5 기록이 적을 때**: 기본 볼트로 두고 "기록이 쌓이면 다시 분석" 안내만 전한다
+
 ## E. 실패 대응
 
 | 실패 위치 | 흔한 원인 | 조치 |
 |---|---|---|
 | [1] 필수 도구 없음 | node/git 미설치, Node 20.12 미만 | 사용자에게 설치 명령 안내 후 재실행 |
 | [2] venv | uv 설치 직후 PATH 미반영 | 새 터미널에서 재실행 |
-| [3] claude-mem | npm 네트워크, 권한 | `npx -y claude-mem@13.24.23 install --provider <p> --no-auto-start`를 직접 실행해 오류 확인 |
+| [3] claude-mem | npm 네트워크, 권한 | `npx -y claude-mem@<권장판> install --provider <p> --no-auto-start`(권장판: `python bin/sb_claude_mem.py`의 `recommended`)를 직접 실행해 오류 확인 |
 | [3] `chroma-mcp 고정 설치 실패` 경고 | uv 네트워크, uv 없음 | 그대로 두면 벡터 동기화가 pydantic 2.14로 멈출 수 있다. 원인을 고친 뒤 설치기 재실행 → doctor `chroma-mcp 기동` ✅ 확인 |
 | [4] 임베딩 | Ollama 서버 미기동, 모델 다운로드 실패 | Ollama 앱 실행 → 재실행(BGE-m3-ko GGUF 1.2GB를 받는다. 실패하면 bge-m3로 내려감). 급하면 `--no-embed` |
 | [7] Codex | 신뢰 등록 실패 | venv 파이썬으로 `installer/codex_trust.py trust --match "<키트 경로>"` |

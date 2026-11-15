@@ -145,6 +145,18 @@ class HealthTests(unittest.TestCase):
             self.assertEqual(sb_health.restart_worker(wait=0), 'fail')
         run.assert_not_called()
 
+    def test_claude_mem_version_out_of_range_is_warning_only(self) -> None:
+        import sb_claude_mem
+        with patch.object(sb_claude_mem, 'installed_version', return_value='13.39.0'):
+            r = sb_health.check_claude_mem_version()
+        self.assertFalse(r['ok'])
+        self.assertIsNone(r['fix'])   # 고치기 없음 — 경고만
+        self.assertIn('13.39.0', sb_health.warning_line({'claude-mem-version': r}))
+        with patch.object(sb_claude_mem, 'installed_version', return_value=sb_claude_mem.RECOMMENDED):
+            self.assertTrue(sb_health.check_claude_mem_version()['ok'])
+        with patch.object(sb_claude_mem, 'installed_version', return_value=None):
+            self.assertTrue(sb_health.check_claude_mem_version()['ok'])   # 미설치는 다른 점검(worker)이 잡는다
+
     def restart_with(self, pids, up: bool = True):
         """재시작 전후 /api/health pid 를 pids 순서로 돌려주며 restart_worker 를 부른다."""
         root = self.home / 'plugin'

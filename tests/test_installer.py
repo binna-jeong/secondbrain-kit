@@ -257,20 +257,100 @@ class EmbedModelTest(unittest.TestCase):
 
 
 class ChromaPinTest(unittest.TestCase):
+    def _with_fixture(self, version):
+        """플러그인 캐시를 tests/fixtures/claude-mem/<version>.cjs 조각으로 흉내 낸다."""
+        tmp = Path(tempfile.mkdtemp())
+        root = tmp / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem' / version / 'scripts'
+        root.mkdir(parents=True)
+        (root / 'worker-service.cjs').write_text(
+            (Path(__file__).parent / 'fixtures' / 'claude-mem' / (version + '.cjs')).read_text(encoding='utf-8'), encoding='utf-8')
+        return mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(tmp)})
+
     def test_chroma_uvx_pins_pydantic(self):
-        i = inst.CHROMA_UVX.index('pydantic<2.14')
-        self.assertEqual(inst.CHROMA_UVX[i - 1], '--with')
-        self.assertEqual(inst.CHROMA_UVX[-2:], ['--from', 'chroma-mcp==0.2.6'])
+        with self._with_fixture('13.34.2'):
+            args, ok = inst.chroma_uvx_args(settings={})
+        self.assertTrue(ok)
+        i = args.index('pydantic<2.14')
+        self.assertEqual(args[i - 1], '--with')
+        self.assertEqual(args[:2], ['--python', '3.13'])
+        self.assertEqual(args[-2:], ['--from', 'chroma-mcp==0.2.6'])
 
     def test_worker_path_gets_pinned_tool(self):
         # 워커는 자기 인자로 uvx 를 부르므로 같은 요구를 만족하는 고정 도구를 깔아 둔다
-        with mock.patch.object(inst, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+        with self._with_fixture('13.34.2'), \
+                mock.patch.object(inst, 'read_json', return_value={}), \
+                mock.patch.object(inst, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
             inst.pin_chroma_mcp({'uv': 'uv'})
         argv = run.call_args[0][0]
         self.assertEqual(argv[:3], ['uv', 'tool', 'install'])
         self.assertIn('pydantic<2.14', argv)
+        self.assertIn('chromadb==1.5.9', argv)   # 13.29+ 워커 요구 — 빠지면 chromadb 새 판에서 재사용이 끊긴다
         self.assertEqual(argv[-1], 'chroma-mcp==0.2.6')
         self.assertNotIn('--from', argv)
+
+    def test_pinned_tool_is_superset_of_worker_args(self):
+        # uvx 는 도구가 워커의 --python·모든 --with 를 만족할 때만 재사용한다(2026-11-15 격리 실측)
+        for version in ('13.24.23', '13.34.2', '13.39.0'):
+            with self._with_fixture(version):
+                args, ok = inst.chroma_uvx_args(settings={})
+                withs, ver, parsed = inst.sb_claude_mem.worker_chroma_spec()
+            self.assertTrue(ok and parsed, version)
+            tool_with = [args[i + 1] for i, a in enumerate(args) if a == '--with']
+            self.assertTrue(set(withs) <= set(tool_with), version)
+            self.assertEqual(sum(1 for w in tool_with if w.startswith('pydantic')), 1, version)
+            self.assertEqual(args[-1], 'chroma-mcp==' + ver, version)
+
+    def test_pin_uses_recommended_defaults_before_first_plugin_install(self):
+        with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': tempfile.mkdtemp()}), \
+                mock.patch.object(inst, 'read_json', return_value={}), \
+                mock.patch.object(inst, 'run', return_value=subprocess.CompletedProcess([], 0)) as run, \
+                mock.patch.object(inst, 'WARNINGS', []) as warnings:
+            inst.pin_chroma_mcp({'uv': 'uv'})
+        argv = run.call_args[0][0]
+        self.assertIn('chromadb==1.5.9', argv)   # 기본값 = 권장판 워커 인자
+        self.assertEqual(warnings, [])
+
+    def test_pin_skips_when_plugin_dir_is_broken(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem' / '13.99.0').mkdir(parents=True)   # scripts 없음
+        with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(tmp)}), \
+                mock.patch.object(inst, 'read_json', return_value={}), \
+                mock.patch.object(inst, 'run') as run, mock.patch.object(inst, 'WARNINGS', []) as warnings:
+            inst.pin_chroma_mcp({'uv': 'uv'})
+        run.assert_not_called()
+        self.assertEqual(len(warnings), 1)
+
+    def test_write_json_keeps_symlink_and_mode(self):
+        tmp = Path(tempfile.mkdtemp())
+        real = tmp / 'dot' / 'settings.json'
+        real.parent.mkdir()
+        real.write_text('{}', encoding='utf-8')
+        os.chmod(real, 0o600)
+        link = tmp / 'settings.json'
+        link.symlink_to(real)
+        with mock.patch.object(inst, 'DRY', False), mock.patch.object(inst, 'backup'):
+            inst.write_json(link, {'a': 1})
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(json.loads(real.read_text()), {'a': 1})
+        self.assertEqual(real.stat().st_mode & 0o777, 0o600)
+
+    def test_pin_skips_when_installed_worker_unreadable(self):
+        tmp = Path(tempfile.mkdtemp())
+        root = tmp / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem' / '13.99.0' / 'scripts'
+        root.mkdir(parents=True)
+        (root / 'worker-service.cjs').write_text('class A{static somethingElse(){}}', encoding='utf-8')
+        with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(tmp)}), \
+                mock.patch.object(inst, 'read_json', return_value={}), \
+                mock.patch.object(inst, 'run') as run, \
+                mock.patch.object(inst, 'WARNINGS', []) as warnings:
+            inst.pin_chroma_mcp({'uv': 'uv'})
+        run.assert_not_called()   # 어긋난 고정 도구를 깔지 않는다
+        self.assertEqual(len(warnings), 1)
+
+    def test_default_claude_mem_is_recommended(self):
+        self.assertEqual(inst.sb_claude_mem.RECOMMENDED, '13.34.2')
+        if not os.environ.get('SBKIT_CLAUDE_MEM_VERSION'):
+            self.assertEqual(inst.CLAUDE_MEM_VERSION, inst.sb_claude_mem.RECOMMENDED)
 
     def test_pin_failure_is_warned(self):
         with mock.patch.object(inst, 'run', return_value=subprocess.CompletedProcess([], 2)), \
@@ -278,19 +358,58 @@ class ChromaPinTest(unittest.TestCase):
             inst.pin_chroma_mcp({'uv': 'uv'})
         self.assertEqual(len(warnings), 1)
 
-    def test_doctor_uses_worker_args_which_the_pinned_tool_satisfies(self):
-        # 워커 인자 = 설치기 고정 인자에서 --python·pydantic 고정을 뺀 것. 어긋나면 uvx 가 고정 도구를 재사용하지 않는다
-        i = inst.CHROMA_UVX.index('pydantic<2.14')
-        self.assertEqual(doctor.WORKER_CHROMA_ARGS[:-1], inst.CHROMA_UVX[2:i - 1] + inst.CHROMA_UVX[i + 1:])
-        self.assertEqual(doctor.WORKER_CHROMA_ARGS[-1], 'chroma-mcp')
+    def test_doctor_uses_installed_worker_args(self):
+        with self._with_fixture('13.34.2'):
+            (level, _, _), call = self._doctor_chroma(0, '')
+        self.assertEqual(level, '✅')
+        argv = call[0][0]
+        self.assertIn('chromadb==1.5.9', argv)
+        self.assertNotIn('pydantic<2.14', argv)   # 워커와 같은 인자여야 고정 도구 재사용 여부를 그대로 본다
+        self.assertEqual(argv[-2:], ['chroma-mcp', '--help'])
 
-    def _doctor_chroma(self, rc, stderr):
+    def test_doctor_warns_when_worker_args_unreadable(self):
+        (level, _, detail), _ = self._doctor_chroma(0, '', parsed=False)
+        self.assertEqual(level, '⚠')
+        self.assertIn('워커 인자', detail)
+
+    def _doctor_version(self, version, venv_chromadb):
+        with self._with_fixture(version), \
+                mock.patch.object(doctor, 'rows', []) as rows, \
+                mock.patch.object(doctor, 'venv_chromadb', return_value=venv_chromadb):
+            doctor.check_claude_mem_version()
+        return {name: (level, detail) for level, name, detail in rows}
+
+    def test_doctor_version_in_range(self):
+        r = self._doctor_version('13.34.2', '1.5.9')
+        self.assertEqual(r['claude-mem 버전'][0], '✅')
+        self.assertEqual(r['chromadb 판 일치'][0], '✅')
+
+    def test_doctor_version_out_of_range_warns_only(self):
+        r = self._doctor_version('13.39.0', '1.5.9')
+        self.assertEqual(r['claude-mem 버전'][0], '⚠')
+        self.assertNotIn('❌', [lv for lv, _ in r.values()])
+
+    def test_doctor_flags_broken_plugin_cache(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem' / '13.34.2').mkdir(parents=True)
+        with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(tmp)}), mock.patch.object(doctor, 'rows', []) as rows:
+            doctor.check_claude_mem_version()
+        self.assertEqual(rows[0][0], '❌')
+
+    def test_doctor_flags_chromadb_mismatch(self):
+        r = self._doctor_version('13.34.2', '1.5.8')
+        self.assertEqual(r['chromadb 판 일치'][0], '⚠')
+        self.assertIn('1.5.8', r['chromadb 판 일치'][1])
+
+    def _doctor_chroma(self, rc, stderr, parsed=True):
         res = subprocess.CompletedProcess([], rc, '', stderr)
         with mock.patch.object(doctor, 'rows', []) as rows, \
                 mock.patch.object(doctor.sb_config, 'claude_mem_settings', return_value={}), \
                 mock.patch.object(doctor.shutil, 'which', return_value='/bin/uvx'), \
+                mock.patch.object(doctor.sb_claude_mem, 'worker_chroma_spec',
+                                  return_value=(list(doctor.sb_claude_mem.FALLBACK_WITH), '0.2.6', parsed)), \
                 mock.patch.object(doctor.subprocess, 'run', return_value=res) as sp:
-            doctor.check_chroma_mcp()
+            doctor.check_chroma_mcp()   # 이 기계에 claude-mem 이 깔렸는지와 무관하게(CI 에는 없다)
         return rows[0], sp.call_args
 
     def test_doctor_flags_pydantic_import_error(self):
