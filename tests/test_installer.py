@@ -368,8 +368,7 @@ class ChromaPinTest(unittest.TestCase):
         self.assertEqual(argv[-2:], ['chroma-mcp', '--help'])
 
     def test_doctor_warns_when_worker_args_unreadable(self):
-        with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': tempfile.mkdtemp()}):
-            (level, _, detail), _ = self._doctor_chroma(0, '')
+        (level, _, detail), _ = self._doctor_chroma(0, '', parsed=False)
         self.assertEqual(level, '⚠')
         self.assertIn('워커 인자', detail)
 
@@ -402,13 +401,15 @@ class ChromaPinTest(unittest.TestCase):
         self.assertEqual(r['chromadb 판 일치'][0], '⚠')
         self.assertIn('1.5.8', r['chromadb 판 일치'][1])
 
-    def _doctor_chroma(self, rc, stderr):
+    def _doctor_chroma(self, rc, stderr, parsed=True):
         res = subprocess.CompletedProcess([], rc, '', stderr)
         with mock.patch.object(doctor, 'rows', []) as rows, \
                 mock.patch.object(doctor.sb_config, 'claude_mem_settings', return_value={}), \
                 mock.patch.object(doctor.shutil, 'which', return_value='/bin/uvx'), \
+                mock.patch.object(doctor.sb_claude_mem, 'worker_chroma_spec',
+                                  return_value=(list(doctor.sb_claude_mem.FALLBACK_WITH), '0.2.6', parsed)), \
                 mock.patch.object(doctor.subprocess, 'run', return_value=res) as sp:
-            doctor.check_chroma_mcp()
+            doctor.check_chroma_mcp()   # 이 기계에 claude-mem 이 깔렸는지와 무관하게(CI 에는 없다)
         return rows[0], sp.call_args
 
     def test_doctor_flags_pydantic_import_error(self):

@@ -105,9 +105,10 @@ def classify_path(p: str) -> str:
         if sb_scope.path_within(real, _norm(os.path.join(home, d))):   # 심볼릭 링크로 옮긴 폴더도 같은 뿌리로 본다
             return 'automation'
     # 임시 폴더를 홈 판정보다 먼저 본다(%TEMP% 가 홈 아래인 윈도우). 단 홈 자체를 품은 임시 뿌리는 빼고 본다 —
-    # 홈이 임시 폴더 아래면(격리 시험·일회용 계정) 그 홈 아래 전부가 임시가 되어 버린다.
+    # 홈이 임시 폴더 아래면(격리 시험·일회용 계정) 그 홈 아래 전부가 임시가 되어 버린다. 그 홈 밖의 임시 폴더는 그대로 임시다.
     temp = [_norm(r) for r in sync_automemory.temp_roots()]
-    if any(sb_scope.path_within(real, r) and not sb_scope.path_within(home, r) for r in temp):
+    if any(sb_scope.path_within(real, r) and not (sb_scope.path_within(home, r) and sb_scope.path_within(real, home))
+           for r in temp):
         return 'temp'
     if sb_scope.path_within(real, home):
         return 'project'
