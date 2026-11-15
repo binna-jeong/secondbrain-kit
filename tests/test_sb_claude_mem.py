@@ -172,6 +172,15 @@ class HardeningTests(unittest.TestCase):
             'claude-mem@thedotmack': [{'installPath': str(base / '13.34.2'), 'version': '13.34.2'}]}}), encoding='utf-8')
         with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(tmp)}):
             self.assertEqual(cm.plugin_root().name, '13.34.2')   # 캐시에 더 높은 판이 있어도 등록된 판
+            reg = tmp / 'plugins' / 'installed_plugins.json'
+            outside = tmp / 'outside' / '13.99.0' / 'scripts'
+            outside.mkdir(parents=True)
+            (outside / 'worker-service.cjs').write_text(fixture('13.39.0'), encoding='utf-8')
+            reg.write_text(json.dumps({'plugins': {'claude-mem@x': [{'installPath': str(outside.parent)}]}}), encoding='utf-8')
+            self.assertEqual(cm.plugin_root().name, '13.39.0')   # 캐시 밖 등록은 무시하고 캐시 최고 판
+            reg.write_text(json.dumps({'plugins': {'claude-mem@x': [{'installPath': str(base / '13.34.2')},
+                                                                     {'installPath': str(base / '13.39.0')}]}}), encoding='utf-8')
+            self.assertEqual(cm.plugin_root().name, '13.39.0')   # 여러 판 등록이면 가장 높은 판
             (tmp / 'plugins' / 'installed_plugins.json').unlink()
             self.assertEqual(cm.plugin_root().name, '13.39.0')
 

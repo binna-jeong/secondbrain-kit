@@ -97,7 +97,10 @@ def classify_path(p: str) -> str:
     home = _home()
     if real == home or real in (os.path.normcase(os.path.realpath(os.sep)),) or len(real) <= 3:
         return 'home'
-    for d in ('.claude', '.claude-mem', '.codex', '.gemini', '.omo', '.cache', 'Library'):
+    for d in ('.cache', 'tmp', '.tmp', 'Temp', os.path.join('AppData', 'Local', 'Temp')):   # 홈 아래 임시 폴더
+        if sb_scope.path_within(real, os.path.normcase(os.path.join(home, d))):
+            return 'temp'
+    for d in ('.claude', '.claude-mem', '.codex', '.gemini', '.omo', 'Library'):
         if sb_scope.path_within(real, os.path.join(home, d)):
             return 'automation'
     # 임시 폴더를 홈 판정보다 먼저 본다(%TEMP% 가 홈 아래인 윈도우). 단 홈 자체를 품은 임시 뿌리는 빼고 본다 —
@@ -309,11 +312,13 @@ def analyze(db_path: Optional[str] = None, projects_root: Optional[str] = None, 
             real_root = root
             key = _suggest_key(root, taken)
             conf = 1.0 if 'git' in g['signals'] else 0.7
+        norm_taken = {sb_scope._norm_name(k): k for k in taken}
         if root.startswith('alias:'):
             pass
-        elif key in taken and taken[key] != real_root:   # 같은 이름 — 결정적인 꼬리 번호를 붙인다
+        elif sb_scope._norm_name(key) in norm_taken and taken[norm_taken[sb_scope._norm_name(key)]] != real_root:
+            # sb_scope 의 이름 비교 규칙(대소문자·_/- 무시)으로도 겹치면 같은 이름이다 — 결정적인 꼬리 번호를 붙인다
             n = 2
-            while '%s-%d' % (key, n) in taken:
+            while sb_scope._norm_name('%s-%d' % (key, n)) in norm_taken:
                 n += 1
             key = '%s-%d' % (key, n)
         taken.setdefault(key, real_root)

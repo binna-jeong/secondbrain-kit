@@ -66,14 +66,19 @@ def active_root() -> Optional[Path]:
         data = json.loads(reg.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return None
+    cache = os.path.realpath(plugin_base())
+    found = []
     for key, entries in (data.get('plugins') or {}).items():
         if not str(key).startswith('claude-mem@'):
             continue
         for e in entries if isinstance(entries, list) else [entries]:
             p = Path(str((e or {}).get('installPath') or '')).expanduser()
-            if p.name and _usable(p):
-                return p
-    return None
+            # 플러그인 캐시 안의 경로만 믿는다 — 등록 파일이 엉뚱한 곳을 가리키면 쓰지 않는다
+            if p.name and _usable(p) and os.path.realpath(p).startswith(cache + os.sep):
+                found.append(p)
+    if len(found) > 1:   # 여러 판이 등록돼 있으면 가장 높은 판(같은 숫자면 안정판)
+        found.sort(key=lambda d: vkey(d.name))
+    return found[-1] if found else None
 
 
 def plugin_root() -> Optional[Path]:

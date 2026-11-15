@@ -366,6 +366,17 @@ class PlanApplyTests(VaultEnv):
             self.assertTrue(r2['rollback']['ok'])
             self.assertEqual(len(r2['rollback_attempts']), 2)
 
+    def test_home_cache_is_temp(self):
+        self.assertEqual(sb_vault.classify_path(str(self.home / '.cache' / 'x')), 'temp')
+        self.assertEqual(sb_vault.classify_path(str(self.home / 'tmp' / 'job')), 'temp')
+
+    def test_key_collision_uses_sb_scope_name_rule(self):
+        ap = self.sbhome / 'config' / 'project_aliases.json'
+        ap.write_text(json.dumps({'Beta': [str(self.home / 'elsewhere')]}), encoding='utf-8')   # 대소문자만 다름
+        p = self.plan()
+        keys = {sc['key'] for sc in p['scopes']}
+        self.assertNotIn('beta', keys)
+
     def test_new_files_are_private(self):
         p = self.plan()
         sb_vault.apply_plan(p, p['plan_hash'])
