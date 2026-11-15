@@ -68,11 +68,16 @@ def active_root() -> Optional[Path]:
         return None
     cache = os.path.realpath(plugin_base())
     found = []
-    for key, entries in (data.get('plugins') or {}).items():
+    plugins = data.get('plugins') if isinstance(data, dict) else None
+    if not isinstance(plugins, dict):   # 형식이 다른 등록 파일은 없는 것으로 보고 캐시에서 고른다
+        return None
+    for key, entries in plugins.items():
         if not str(key).startswith('claude-mem@'):
             continue
         for e in entries if isinstance(entries, list) else [entries]:
-            p = Path(str((e or {}).get('installPath') or '')).expanduser()
+            if not isinstance(e, dict):
+                continue
+            p = Path(str(e.get('installPath') or '')).expanduser()
             # 플러그인 캐시 안의 경로만 믿는다 — 등록 파일이 엉뚱한 곳을 가리키면 쓰지 않는다
             if p.name and _usable(p) and os.path.realpath(p).startswith(cache + os.sep):
                 found.append(p)
@@ -147,9 +152,13 @@ def parse_worker_spec(text: str) -> Tuple[List[str], str, bool]:
             return fail   # 정의 뒤에 배열을 바꾸는 코드가 있으면 실제 실행 값을 알 수 없다
         withs = re.findall(r'"([^"\\]*)"', arrs[0])
     else:
-        withs = re.findall(r'"--with","([^"\\]*)"', body)
-        if not withs:
+        # 압축기가 상수를 인라인한 꼴만 받는다: return["--python",<변수>,("--with","…",)*"--from","chroma-mcp==…","chroma-mcp"]
+        # 주석·함수 호출·펼치기·템플릿 같은 다른 토큰이 하나라도 있으면 실제 값을 알 수 없으므로 실패로 본다.
+        dm = re.fullmatch(r'\s*return\s*\[\s*"--python"\s*,\s*[\w$]+\s*,((?:\s*"--with"\s*,\s*"[^"\\]*"\s*,)+)'
+                          r'\s*"--from"\s*,\s*"chroma-mcp==' + _VER + r'"\s*,\s*"chroma-mcp"\s*\]\s*;?\s*', body)
+        if not dm:
             return fail
+        withs = re.findall(r'"--with"\s*,\s*"([^"\\]*)"', dm.group(1))
     if not vkey(ver):
         return fail
     return withs, ver, True
@@ -183,8 +192,12 @@ def worker_args(withs: List[str], chroma_ver: str) -> List[str]:
 
 
 def _pydantic_safe(req: str) -> bool:
-    """이 요구 하나만으로 pydantic 2.14 미만이 보장되는가(보수적으로 해석 — 모르면 False)."""
-    r = re.sub(r'\s+', '', req.split(';')[0])
+    """이 요구 하나만으로 pydantic 2.14 미만이 보장되는가(보수적으로 해석 — 모르면 False).
+    환경 표시(; python_version<"3.13" 같은)가 붙은 요구는 지금 파이썬에서 적용되는지 알 수 없어 보장으로 치지 않는다
+    — 그때는 pydantic 고정을 따로 더한다."""
+    if ';' in req:
+        return False
+    r = re.sub(r'\s+', '', req)
     m = re.match(r'pydantic(?:\[[^\]]*\])?(.*)$', r, re.I)
     if not m:
         return False

@@ -230,10 +230,15 @@ def setup_venv(tools) -> None:
 # ── 3 claude-mem ────────────────────────────────────────────────────
 def install_claude_mem(args, tools) -> None:
     say('\n[3] claude-mem %s' % CLAUDE_MEM_VERSION)
-    installed = (HOME / '.claude/plugins/cache/thedotmack/claude-mem').exists()
-    if installed and not args.reinstall_claude_mem:
+    base = HOME / '.claude/plugins/cache/thedotmack/claude-mem'
+    # 폴더가 있다는 것만으로는 설치됐다고 보지 않는다 — 워커(scripts/worker-service.cjs)가 있는 판이 있어야 한다.
+    # 지난 설치가 중간에 끊겨 빈 폴더만 남았으면 다시 깐다.
+    usable = base.is_dir() and any(sb_claude_mem._usable(d) for d in base.iterdir())
+    if usable and not args.reinstall_claude_mem:
         say('  이미 설치됨 — 건너뜀 (--reinstall-claude-mem 으로 재실행)')
         return
+    if base.exists() and not usable:
+        say('  설치 폴더는 있는데 워커가 있는 판이 없습니다 — 다시 설치합니다')
     cmd = ['npx', '-y', 'claude-mem@%s' % CLAUDE_MEM_VERSION, 'install', '--provider', args.provider,
            '--no-auto-start']
     run(cmd if not IS_WIN else ['cmd', '/c'] + cmd)

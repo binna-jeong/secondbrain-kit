@@ -185,5 +185,32 @@ class HardeningTests(unittest.TestCase):
             self.assertEqual(cm.plugin_root().name, '13.39.0')
 
 
+class Round3ParseTests(unittest.TestCase):
+    """2026-11-15 GPT Pro 3차 리뷰: 인라인 리터럴은 정확한 꼴만, 환경 표시 붙은 pydantic 고정은 보장으로 치지 않는다."""
+
+    def test_literal_with_extra_tokens_fails_closed(self):
+        for body in ('return["--python",e,"--with","x",/*c*/"--with","y","--from","chroma-mcp==0.3.1","chroma-mcp"]',
+                     'return["--python",e,"--with",f(),"--from","chroma-mcp==0.3.1","chroma-mcp"]',
+                     'return["--python",e,...extra,"--with","x","--from","chroma-mcp==0.3.1","chroma-mcp"]'):
+            t = 'class A{static buildLauncherPrefix(e){' + body + '}static b(){}}'
+            self.assertFalse(cm.parse_worker_spec(t)[2], body)
+
+    def test_marker_pydantic_not_safe(self):
+        self.assertFalse(cm._pydantic_safe('pydantic<2.14; python_version<"3.13"'))
+        self.assertIn(cm.PYDANTIC_PIN, cm.tool_requirements(['pydantic<2.14; python_version<"3.13"']))
+
+    def test_malformed_registry_falls_back_to_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem' / '13.34.2' / 'scripts'
+            base.mkdir(parents=True)
+            (base / 'worker-service.cjs').write_text('x', encoding='utf-8')
+            reg = Path(d) / 'plugins' / 'installed_plugins.json'
+            with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': d}):
+                for bad in ('[]', '{"plugins": []}', '{"plugins": {"claude-mem@x": ["s", 1]}}'):
+                    reg.write_text(bad, encoding='utf-8')
+                    self.assertIsNone(cm.active_root(), bad)
+                    self.assertEqual(cm.plugin_root().name, '13.34.2', bad)
+
+
 if __name__ == '__main__':
     unittest.main()

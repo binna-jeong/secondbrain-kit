@@ -317,7 +317,8 @@ class PlanApplyTests(VaultEnv):
         with mock.patch.object(sb_vault, '_atomic_write', die_on_vault_json):
             with self.assertRaises(SystemExit):
                 sb_vault.apply_plan(p, p['plan_hash'])
-        self.assertFalse((sb_vault.vault_dir() / '.apply.lock').exists())   # with 블록이 잠금을 풀었다(kill -9 은 10분+pid 검사로 회수)
+        with sb_vault._Lock():   # with 블록이 OS 잠금을 풀었다(kill -9 이면 OS 가 푼다) — 바로 다시 잡힌다
+            pass
         self.assertNotEqual(sha(ap), before)            # 별칭은 이미 바뀐 상태
         rec = sb_vault.rollback(sb_vault.latest('apply'))
         self.assertTrue(rec['rollback']['ok'], rec['rollback'])
@@ -597,6 +598,117 @@ class InstallerOnboardTests(VaultEnv):
         v = json.loads(sb_vault.vault_json_path().read_text())
         self.assertTrue(v['default'])
         self.assertTrue(list(sb_vault.vault_dir().glob('analysis-*.json')))
+
+
+class Round3Tests(VaultEnv):
+    """2026-11-15 GPT Pro 3차 리뷰 지적."""
+
+    def plan(self, mode='all'):
+        return sb_vault.make_plan(self.analysis(), None, mode)
+
+    def test_duplicate_real_targets_rejected_before_write(self):
+        ap = self.sbhome / 'config' / 'project_aliases.json'
+        ap.write_text('{}\n', encoding='utf-8')
+        before = ap.read_bytes()
+        p = self.plan()
+        with mock.patch.dict(os.environ, {'SB_LOOPS_PATH': str(ap)}):
+            with self.assertRaises(SystemExit):
+                sb_vault.apply_plan(p, p['plan_hash'])
+        self.assertEqual(ap.read_bytes(), before)
+        self.assertFalse(sb_vault.vault_json_path().exists())
+
+    def test_crlf_backup_restored_byte_for_byte(self):
+        ap = self.sbhome / 'config' / 'project_aliases.json'
+        ap.write_bytes(b'{\r\n "x": ["~/x"]\r\n}\r\n')
+        before = ap.read_bytes()
+        p = self.plan()
+        rec = sb_vault.apply_plan(p, p['plan_hash'])
+        self.assertTrue(rec['verify']['ok'], rec['verify'])
+        self.assertTrue(any(c['check'].startswith('hash ') for c in rec['verify']['checks']))
+        sb_vault.rollback(Path(rec['apply_path']))
+        self.assertEqual(ap.read_bytes(), before)
+
+    def _applied(self):
+        ap = self.sbhome / 'config' / 'project_aliases.json'
+        ap.write_text('{}\n', encoding='utf-8')
+        p = self.plan()
+        rec = sb_vault.apply_plan(p, p['plan_hash'])
+        return ap, Path(rec['apply_path'])
+
+    def test_record_forged_new_file_entry_keeps_content(self):
+        # 기록을 '새로 만든 파일'로 꾸며도 내용은 지워지지 않고 백업 폴더로 옮겨진다
+        ap, path = self._applied()
+        content = ap.read_bytes()
+        data = json.loads(path.read_text())
+        for b in data['backups']:
+            if b['name'] == 'aliases':
+                b['backup_path'] = None
+                b['sha256_before'] = None
+        path.write_text(json.dumps(data))
+        sb_vault.rollback(path)
+        kept = list((sb_vault.vault_dir() / 'backup' / data['id']).glob('removed-aliases-*'))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_bytes(), content)
+
+    def test_record_backup_hash_mismatch_rejected(self):
+        ap, path = self._applied()
+        data = json.loads(path.read_text())
+        bk = next(b for b in data['backups'] if b['name'] == 'aliases')
+        Path(bk['backup_path']).write_text('{"tampered": []}\n', encoding='utf-8')
+        with self.assertRaises(SystemExit):
+            sb_vault.rollback(path)
+
+    def test_record_backup_from_other_apply_rejected(self):
+        ap, path = self._applied()
+        data = json.loads(path.read_text())
+        other = sb_vault.vault_dir() / 'backup' / 'other-id'
+        other.mkdir(parents=True)
+        bk = next(b for b in data['backups'] if b['name'] == 'aliases')
+        dst = other / 'aliases.bak'
+        dst.write_bytes(Path(bk['backup_path']).read_bytes())
+        bk['backup_path'] = str(dst)
+        path.write_text(json.dumps(data))
+        with self.assertRaises(SystemExit):
+            sb_vault.rollback(path)
+
+    def test_malformed_writes_is_clean_error(self):
+        ap, path = self._applied()
+        data = json.loads(path.read_text())
+        data['writes'] = [{'target': 1}]
+        path.write_text(json.dumps(data))
+        with self.assertRaises(SystemExit):
+            sb_vault.rollback(path)
+
+    def test_lock_survives_long_holder(self):
+        # 잠금은 나이가 아니라 OS 잠금으로 판단한다 — 오래된 잠금 파일이 있어도 잡은 쪽이 살아 있으면 못 잡는다
+        with sb_vault._Lock() as lk:
+            old = time.time() - 3600
+            os.utime(str(lk.path), (old, old))
+            with self.assertRaises(SystemExit):
+                with sb_vault._Lock():
+                    pass
+
+    def test_existing_alias_norm_duplicate_blocks_apply(self):
+        ap = self.sbhome / 'config' / 'project_aliases.json'
+        ap.write_text(json.dumps({'My_Proj': ['~/a'], 'my-proj': ['~/b']}), encoding='utf-8')
+        p = self.plan()
+        self.assertTrue(any(c.get('blocking') for c in p['conflicts']))
+        with self.assertRaises(SystemExit):
+            sb_vault.apply_plan(p, p['plan_hash'])
+
+    def test_init_default_files_are_private(self):
+        sb_vault.init_default()
+        if os.name != 'nt':
+            self.assertEqual(sb_vault.vault_json_path().stat().st_mode & 0o777, 0o600)
+            self.assertEqual(sb_vault.loops_path().stat().st_mode & 0o777, 0o600)
+
+    def test_symlinked_automation_root_is_automation(self):
+        real = self.root / 'dotfiles-claude'
+        (real / 'x').mkdir(parents=True)
+        subprocess.run(['git', 'init', '-q', str(real)], check=True)
+        link = self.home / '.codex'
+        link.symlink_to(real)
+        self.assertEqual(sb_vault.classify_path(str(link / 'x')), 'automation')
 
 
 if __name__ == '__main__':

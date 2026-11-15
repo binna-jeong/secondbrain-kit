@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 BIN = Path(__file__).resolve().parent
 sys.path.insert(0, str(BIN))
 import sb_config  # noqa: E402
+import sb_lock  # noqa: E402
 import sb_scope  # noqa: E402
 import sync_automemory  # noqa: E402
 
@@ -101,7 +102,7 @@ def classify_path(p: str) -> str:
         if sb_scope.path_within(real, os.path.normcase(os.path.join(home, d))):
             return 'temp'
     for d in ('.claude', '.claude-mem', '.codex', '.gemini', '.omo', 'Library'):
-        if sb_scope.path_within(real, os.path.join(home, d)):
+        if sb_scope.path_within(real, _norm(os.path.join(home, d))):   # 심볼릭 링크로 옮긴 폴더도 같은 뿌리로 본다
             return 'automation'
     # 임시 폴더를 홈 판정보다 먼저 본다(%TEMP% 가 홈 아래인 윈도우). 단 홈 자체를 품은 임시 뿌리는 빼고 본다 —
     # 홈이 임시 폴더 아래면(격리 시험·일회용 계정) 그 홈 아래 전부가 임시가 되어 버린다.
@@ -454,6 +455,13 @@ def make_plan(analysis: Dict[str, Any], analysis_ref: Optional[str] = None, stat
     aliases = sb_scope._load_aliases()
     alias_path_owner = {_norm(e): k for k, v in aliases.items() for e in v if sb_scope.is_path_entry(e)}
     scopes, new_aliases, conflicts, minor = [], {}, [], []
+    by_norm: Dict[str, List[str]] = {}
+    for k in aliases:
+        by_norm.setdefault(sb_scope._norm_name(k), []).append(k)
+    for keys in by_norm.values():
+        if len(keys) > 1:   # sb_scope 는 대소문자·_/- 를 무시해 비교한다 — 기존 별칭끼리 이미 겹치면 어느 쪽인지 모른다
+            conflicts.append({'target': 'project_aliases', 'key': ','.join(sorted(keys)), 'existing': sorted(keys),
+                              'proposed': None, 'blocking': True})
     for p in analysis.get('projects', []):
         if p['obs_count'] < MIN_SCOPE_OBS and p['session_count'] < MIN_SCOPE_SESSIONS:
             minor.append(p['suggested_key'])
@@ -548,10 +556,17 @@ class Changed(RuntimeError):
 _KEEP = object()
 
 
-def _atomic_write(p: Path, data: str, private: bool = False, expect_sha: Any = _KEEP) -> None:
+def _bytes(data: Any) -> bytes:
+    return data if isinstance(data, bytes) else data.encode('utf-8')
+
+
+def _atomic_write(p: Path, data: Any, private: bool = False, expect_sha: Any = _KEEP) -> None:
     """같은 폴더의 고유 임시 파일(O_EXCL)에 쓰고 fsync 뒤 바꿔 끼운다. 기존 파일 권한은 유지한다.
+    바이트 그대로 쓴다(윈도우 텍스트 모드의 개행 변환이 없어 기록한 해시와 실제 파일 해시가 같다).
     expect_sha 를 주면 바꿔 끼우기 바로 전에 대상의 해시를 다시 보고 다르면 Changed 로 멈춘다(None = 없어야 함).
-    남는 틈은 해시 확인과 rename 사이의 짧은 순간뿐이다 — 다른 도구가 쓰는 파일을 OS 수준에서 잠글 방법은 없다."""
+    한계: 해시 확인과 rename 사이의 짧은 틈은 남는다. 키트 프로세스끼리는 _Lock 이 직렬화하지만, 잠금 규약을
+    모르는 다른 도구(편집기 등)가 바로 그 순간에 쓰는 것은 표준 라이브러리로 막을 수 없다. 단일 사용자의 로컬
+    설정 파일이 전제다. 적용 뒤에는 쓴 파일의 해시를 다시 확인해 어긋나면 실패로 보고 되돌린다(apply_plan)."""
     p = _real(p)
     p.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -560,8 +575,8 @@ def _atomic_write(p: Path, data: str, private: bool = False, expect_sha: Any = _
         mode = 0o600 if private else 0o644
     fd, tmp = tempfile.mkstemp(prefix='.' + p.name + '.', suffix='.sbvault-tmp', dir=str(p.parent))
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(data)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(_bytes(data))
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp, mode)
@@ -586,49 +601,34 @@ def _atomic_write(p: Path, data: str, private: bool = False, expect_sha: Any = _
 
 
 class _Lock:
-    """볼트 적용·되돌리기를 한 번에 하나만 돌린다(같은 SB_HOME). 잡지 못하면 바로 실패한다."""
+    """볼트 적용·되돌리기를 한 번에 하나만 돌린다(같은 SB_HOME). 잡지 못하면 바로 실패한다.
+    OS 파일 잠금(POSIX flock, 윈도우 LockFileEx — sb_lock)이라 잡은 프로세스가 죽으면 OS 가 풀어 준다.
+    오래 걸리는 정상 작업의 잠금을 나이로 빼앗는 일이 없다. 잠금 파일은 지우지 않는다(지우면 두 프로세스가
+    옛 파일과 새 파일을 따로 잠글 수 있다)."""
 
     def __init__(self):
         self.path = vault_dir() / '.apply.lock'
-        self.fd = None
+        self.f = None
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o600)
+        self.f = os.fdopen(fd, 'r+b')
         try:
-            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            try:
-                age = time.time() - self.path.stat().st_mtime
-            except FileNotFoundError:
-                age = 0
-            if age < 600 or self._holder_alive():
-                raise SystemExit('다른 sb vault 적용·되돌리기가 진행 중입니다(%s) — 끝난 뒤 다시 하세요' % _short(str(self.path)))
-            os.unlink(str(self.path))   # 10분 넘었고 잡은 프로세스도 없다 — 죽은 프로세스의 흔적
-            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.write(self.fd, str(os.getpid()).encode())
+            sb_lock.lock(self.f, sb_lock.LOCK_EX | sb_lock.LOCK_NB)
+        except OSError:
+            self.f.close()
+            self.f = None
+            raise SystemExit('다른 sb vault 적용·되돌리기가 진행 중입니다(%s) — 끝난 뒤 다시 하세요' % _short(str(self.path)))
         return self
-
-    def _holder_alive(self) -> bool:
-        try:
-            pid = int(self.path.read_text().strip() or 0)
-        except (OSError, ValueError):
-            return False
-        if pid <= 0 or os.name == 'nt':   # 윈도우의 os.kill(pid, 0)은 프로세스를 끝낸다 — 나이만 본다
-            return False
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
 
     def __exit__(self, *a):
         try:
-            os.close(self.fd)
-            os.unlink(str(self.path))
+            sb_lock.lock(self.f, sb_lock.LOCK_UN)
         except OSError:
             pass
+        finally:
+            self.f.close()
         return False
 
 
@@ -690,6 +690,16 @@ def apply_plan(plan: Dict[str, Any], approved_hash: str, approved_by: str = 'use
         raise SystemExit('구성안의 별칭 파일(%s)이 지금 설정된 별칭 파일(%s)과 달라 적용하지 않았습니다 — '
                          'SB_PROJECT_ALIASES 를 확인하고 sb vault plan 을 다시 돌리세요'
                          % (_short(str(targets['aliases'])), _short(str(configured))))
+    reals = [os.path.normcase(str(_real(p))) for p in targets.values()]
+    if len(reals) != len(set(reals)):
+        # 두 대상이 같은 실제 파일이면(예: SB_LOOPS_PATH 를 별칭 파일로 잘못 지정) 앞 쓰기가 뒤 쓰기의 해시 확인을
+        # 깨뜨려 일부만 적용된다 — 쓰기 전에 멈춘다
+        raise SystemExit('볼트 대상 파일 두 개가 같은 파일을 가리켜 적용하지 않았습니다 — SB_LOOPS_PATH·'
+                         'SB_PROJECT_ALIASES·SB_HOME 설정을 확인하세요')
+    blocking = [c for c in plan.get('conflicts', []) if c.get('blocking')]
+    if blocking:
+        raise SystemExit('구성안에 적용을 막는 충돌이 있습니다(%s) — 별칭 파일을 정리한 뒤 sb vault plan 을 다시 돌리세요'
+                         % ', '.join(sorted({str(c.get('key')) for c in blocking})))
     with _Lock():
         # 0) 쓰기 전 검증 — 깨진 파일이 하나라도 있으면 아무것도 쓰지 않는다
         _load_obj(targets['vault_json'], 'vault.json')
@@ -723,7 +733,7 @@ def apply_plan(plan: Dict[str, Any], approved_hash: str, approved_by: str = 'use
             # 쓰기 전에 '이 내용으로 바꾼다'를 기록에 남기고(의도 저널), 바꿔 끼우기 직전에 백업 때 해시와 다시 비교한다.
             # 중간에 죽어도 기록에 예정 해시가 있어, 지금 내용이 그 해시면 우리가 쓴 것으로 알고 되돌릴 수 있다.
             real = _real(targets[name])
-            planned = hashlib.sha256(data.encode('utf-8')).hexdigest()
+            planned = hashlib.sha256(_bytes(data)).hexdigest()
             record['writes'].append({'name': name, 'target': str(real), 'sha256_after': planned})
             _atomic_write(apply_path, json.dumps(record, ensure_ascii=False, indent=1), private=True)
             _atomic_write(real, data, private=True, expect_sha=before_map[str(real)])
@@ -748,6 +758,8 @@ def apply_plan(plan: Dict[str, Any], approved_hash: str, approved_by: str = 'use
                     env[STATE_ENV] = plan['state_env']
                 guarded('settings', json.dumps(cur_settings, ensure_ascii=False, indent=2) + '\n')
             checks = verify_applied(plan)
+            for w in record['writes']:   # 쓴 파일이 지금도 우리가 쓴 내용인가(적용 중 다른 도구가 고쳤는지)
+                checks.append({'check': 'hash ' + w['name'], 'ok': _sha(Path(w['target'])) == w['sha256_after']})
             if _fail_after_write:
                 checks.append({'check': 'forced_failure', 'ok': False})
             record['verify'] = {'ok': all(c['ok'] for c in checks), 'checks': checks}
@@ -786,11 +798,15 @@ def _restore(rec: Dict[str, Any], apply_path: Path, only_ours: bool) -> Dict[str
                 restored.append({'target': b['target'], 'ok': False, 'note': 'changed_by_other'})
                 continue
             if b['backup_path']:
-                _atomic_write(target, Path(b['backup_path']).read_text(encoding='utf-8'), expect_sha=cur)
+                _atomic_write(target, Path(b['backup_path']).read_bytes(), expect_sha=cur)   # 원래 바이트 그대로
             elif target.exists():
+                # 적용이 새로 만든 파일 — 지우지 않고 이 적용의 백업 폴더로 옮긴다. 기록이 틀렸어도(손으로 고친 기록 등)
+                # 내용을 잃지 않는다. 한계: 해시 확인과 이동 사이의 짧은 틈은 _atomic_write 와 같다.
                 if _sha(target) != cur:
                     raise Changed(str(target))
-                target.unlink()     # 적용이 새로 만든 파일 — 지금 내용이 우리가 쓴 그대로일 때만 여기 온다
+                keep = vault_dir() / 'backup' / str(rec.get('id') or 'unknown') / ('removed-%s-%s' % (b.get('name') or 'file', stamp()))
+                keep.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(str(target), str(keep))
             restored.append({'target': b['target'], 'ok': _sha(target) == b['sha256_before']})
         except Exception as e:  # noqa: BLE001
             restored.append({'target': b['target'], 'ok': False, 'error': str(e)[:160]})
@@ -806,23 +822,49 @@ def _restore(rec: Dict[str, Any], apply_path: Path, only_ours: bool) -> Dict[str
     return rec
 
 
+_HEX64 = re.compile(r'[0-9a-f]{64}')
+
+
 def _validate_record(rec: Any, apply_path: Path) -> Dict[str, Any]:
-    """--apply 로 받은 기록은 이 볼트가 만든 것이고 대상이 볼트 대상 파일뿐인지 확인한다(P0-2)."""
-    if not isinstance(rec, dict) or not isinstance(rec.get('backups'), list):
-        raise SystemExit('적용 기록 형식이 아닙니다: %s' % apply_path)
+    """--apply 로 받은 기록이 이 볼트가 만든 것이고 앞뒤가 맞는지 확인한다. 하나라도 어긋나면 되돌리지 않고 멈춘다.
+    - 이름과 대상이 고정 대응(vault_json·aliases·loops·settings → 지금 설정된 실제 경로)
+    - 백업은 이 기록의 backup/<id>/ 아래에 있고, 내용 해시가 sha256_before 와 같다
+    - 백업이 없으면 적용 전 파일도 없었다(sha256_before = None)
+    - writes 항목은 backups 에 있는 대상이고 이름·해시 형식이 맞다"""
+    bad = '적용 기록 형식이 아닙니다: %s' % apply_path
+    if not isinstance(rec, dict) or not isinstance(rec.get('backups'), list) \
+            or not isinstance(rec.get('writes', []), list) or not isinstance(rec.get('id'), str) \
+            or not re.fullmatch(r'[0-9A-Za-z_-]+', rec['id']):
+        raise SystemExit(bad)
     if Path(os.path.realpath(apply_path)).parent != Path(os.path.realpath(vault_dir())):
         raise SystemExit('이 볼트의 적용 기록이 아닙니다: %s' % apply_path)
-    allowed = {str(_real(p)) for p in (vault_json_path(), loops_path(), claude_settings_path(), Path(sb_scope.aliases_path()))}
-    bdir = os.path.realpath(vault_dir() / 'backup')
+    fixed = {'vault_json': vault_json_path(), 'aliases': Path(sb_scope.aliases_path()), 'loops': loops_path(),
+             'settings': claude_settings_path()}
+    fixed = {k: str(_real(v)) for k, v in fixed.items()}
+    bdir = os.path.realpath(vault_dir() / 'backup' / rec['id'])
+    seen: Dict[str, Dict[str, Any]] = {}
     for b in rec['backups']:
-        if not isinstance(b, dict) or not isinstance(b.get('target'), str) \
+        if not isinstance(b, dict) or not isinstance(b.get('name'), str) or not isinstance(b.get('target'), str) \
                 or not isinstance(b.get('backup_path'), (str, type(None))) \
                 or not isinstance(b.get('sha256_before'), (str, type(None))):
-            raise SystemExit('적용 기록 형식이 아닙니다: %s' % apply_path)
-        if b['target'] not in allowed:
+            raise SystemExit(bad)
+        if fixed.get(b['name']) != b['target']:
             raise SystemExit('적용 기록에 볼트 밖 대상이 있어 되돌리지 않았습니다: %s' % b['target'])
-        if b.get('backup_path') and not os.path.realpath(b['backup_path']).startswith(bdir + os.sep):
-            raise SystemExit('적용 기록의 백업 경로가 볼트 밖입니다: %s' % b['backup_path'])
+        if b['target'] in seen or (b['backup_path'] is None) != (b['sha256_before'] is None):
+            raise SystemExit(bad)
+        if b['sha256_before'] is not None:
+            if not _HEX64.fullmatch(b['sha256_before']):
+                raise SystemExit(bad)
+            if not os.path.realpath(b['backup_path']).startswith(bdir + os.sep):
+                raise SystemExit('적용 기록의 백업 경로가 이 적용의 백업 폴더 밖입니다: %s' % b['backup_path'])
+            if _sha(Path(b['backup_path'])) != b['sha256_before']:
+                raise SystemExit('백업 파일이 기록과 달라 되돌리지 않았습니다: %s' % _short(b['backup_path']))
+        seen[b['target']] = b
+    for w in rec.get('writes', []):
+        if not isinstance(w, dict) or not isinstance(w.get('target'), str) or w['target'] not in seen \
+                or not isinstance(w.get('sha256_after'), str) or not _HEX64.fullmatch(w['sha256_after']) \
+                or w.get('name') != seen[w['target']]['name']:
+            raise SystemExit(bad)
     return rec
 
 
@@ -878,10 +920,10 @@ def init_default() -> Dict[str, Any]:
         _atomic_write(vj, json.dumps({
             'version': SCHEMA, 'scopes': {}, 'kind_policy': {'default': 'normal'}, 'state_write_mode': 'all',
             'scope_excluded': DEFAULT_SCOPE_EXCLUDED, 'updated_at': now_iso(), 'plan_hash': None, 'obs_seen': 0,
-            'default': True}, ensure_ascii=False, indent=1) + '\n')
+            'default': True}, ensure_ascii=False, indent=1) + '\n', private=True)
         created.append(str(vj))
     if not loops_path().exists():
-        _atomic_write(loops_path(), '')
+        _atomic_write(loops_path(), '', private=True)
         created.append(str(loops_path()))
     vault_dir().mkdir(parents=True, exist_ok=True)
     return {'created': created, 'vault_json': str(vj)}
@@ -921,7 +963,7 @@ def nudge_line(today: Optional[str] = None, db_path: Optional[str] = None) -> st
             msg = '볼트 구성 뒤 기록이 %d건 → %d건으로 늘었다 — `sb vault analyze`·`plan`으로 새 프로젝트를 확인할 수 있다' % (seen, now_obs)
     if msg:
         try:
-            _atomic_write(_nudge_state(), json.dumps({'last_shown': today, 'obs': now_obs}))
+            _atomic_write(_nudge_state(), json.dumps({'last_shown': today, 'obs': now_obs}), private=True)
         except OSError:
             pass
     return msg
