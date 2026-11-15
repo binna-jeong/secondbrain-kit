@@ -536,8 +536,17 @@ def _real(p: Path) -> Path:
     return Path(os.path.realpath(p)) if Path(p).is_symlink() else Path(p)
 
 
-def _atomic_write(p: Path, data: str, private: bool = False) -> None:
-    """같은 폴더의 고유 임시 파일(O_EXCL)에 쓰고 fsync 뒤 바꿔 끼운다. 기존 파일 권한은 유지한다."""
+class Changed(RuntimeError):
+    """쓰기 직전 대상 파일이 예상한 내용이 아니다(다른 프로세스가 고쳤다)."""
+
+
+_KEEP = object()
+
+
+def _atomic_write(p: Path, data: str, private: bool = False, expect_sha: Any = _KEEP) -> None:
+    """같은 폴더의 고유 임시 파일(O_EXCL)에 쓰고 fsync 뒤 바꿔 끼운다. 기존 파일 권한은 유지한다.
+    expect_sha 를 주면 바꿔 끼우기 바로 전에 대상의 해시를 다시 보고 다르면 Changed 로 멈춘다(None = 없어야 함).
+    남는 틈은 해시 확인과 rename 사이의 짧은 순간뿐이다 — 다른 도구가 쓰는 파일을 OS 수준에서 잠글 방법은 없다."""
     p = _real(p)
     p.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -551,7 +560,18 @@ def _atomic_write(p: Path, data: str, private: bool = False) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.chmod(tmp, mode)
+        if expect_sha is not _KEEP and _sha(p) != expect_sha:
+            raise Changed(str(p))
         os.replace(tmp, p)
+        if os.name != 'nt':   # 이름 바꾸기 자체도 디스크에 남긴다
+            try:
+                dfd = os.open(str(p.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
     except BaseException:
         try:
             os.unlink(tmp)
@@ -576,12 +596,27 @@ class _Lock:
                 age = time.time() - self.path.stat().st_mtime
             except FileNotFoundError:
                 age = 0
-            if age < 600:
+            if age < 600 or self._holder_alive():
                 raise SystemExit('다른 sb vault 적용·되돌리기가 진행 중입니다(%s) — 끝난 뒤 다시 하세요' % _short(str(self.path)))
-            os.unlink(str(self.path))   # 10분 넘은 잠금은 죽은 프로세스의 흔적이다
+            os.unlink(str(self.path))   # 10분 넘었고 잡은 프로세스도 없다 — 죽은 프로세스의 흔적
             self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.write(self.fd, str(os.getpid()).encode())
         return self
+
+    def _holder_alive(self) -> bool:
+        try:
+            pid = int(self.path.read_text().strip() or 0)
+        except (OSError, ValueError):
+            return False
+        if pid <= 0 or os.name == 'nt':   # 윈도우의 os.kill(pid, 0)은 프로세스를 끝낸다 — 나이만 본다
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
 
     def __exit__(self, *a):
         try:
@@ -644,8 +679,15 @@ def apply_plan(plan: Dict[str, Any], approved_hash: str, approved_by: str = 'use
                _fail_after_write: bool = False) -> Dict[str, Any]:
     _check_hash(plan, approved_hash)
     targets = _targets(plan)
+    configured = _real(Path(sb_scope.aliases_path()))
+    if _real(targets['aliases']) != configured:
+        # 볼트는 sb_scope 가 실제로 읽는 별칭 파일에만 쓴다. 다른 파일을 쓰려면 SB_PROJECT_ALIASES 로 바꾼 뒤 다시 plan.
+        raise SystemExit('구성안의 별칭 파일(%s)이 지금 설정된 별칭 파일(%s)과 달라 적용하지 않았습니다 — '
+                         'SB_PROJECT_ALIASES 를 확인하고 sb vault plan 을 다시 돌리세요'
+                         % (_short(str(targets['aliases'])), _short(str(configured))))
     with _Lock():
-        # 0) 쓰기 전 검증 — 깨진 설정이 하나라도 있으면 아무것도 쓰지 않는다
+        # 0) 쓰기 전 검증 — 깨진 파일이 하나라도 있으면 아무것도 쓰지 않는다
+        _load_obj(targets['vault_json'], 'vault.json')
         cur_aliases = _load_obj(targets['aliases'], '별칭 파일')
         cur_settings = _load_obj(targets['settings'], 'Claude 설정') if 'settings' in targets else None
         if cur_settings is not None and not isinstance(cur_settings.get('env', {}), dict):
@@ -673,11 +715,13 @@ def apply_plan(plan: Dict[str, Any], approved_hash: str, approved_by: str = 'use
         before_map = {b['target']: b['sha256_before'] for b in record['backups']}
 
         def guarded(name, data):
+            # 쓰기 전에 '이 내용으로 바꾼다'를 기록에 남기고(의도 저널), 바꿔 끼우기 직전에 백업 때 해시와 다시 비교한다.
+            # 중간에 죽어도 기록에 예정 해시가 있어, 지금 내용이 그 해시면 우리가 쓴 것으로 알고 되돌릴 수 있다.
             real = _real(targets[name])
-            if _sha(real) != before_map[str(real)]:   # P0-5: 백업 뒤 다른 프로세스가 고쳤다
-                raise RuntimeError('적용 중 %s 가 바뀌었다' % _short(str(real)))
-            _atomic_write(real, data)
-            record['writes'].append({'name': name, 'target': str(real), 'sha256_after': _sha(real)})
+            planned = hashlib.sha256(data.encode('utf-8')).hexdigest()
+            record['writes'].append({'name': name, 'target': str(real), 'sha256_after': planned})
+            _atomic_write(apply_path, json.dumps(record, ensure_ascii=False, indent=1), private=True)
+            _atomic_write(real, data, private=True, expect_sha=before_map[str(real)])
 
         try:
             for k, v in plan['aliases'].items():      # 별칭 병합 — 기존 키·경로는 건드리지 않는다
@@ -703,7 +747,8 @@ def apply_plan(plan: Dict[str, Any], approved_hash: str, approved_by: str = 'use
                 checks.append({'check': 'forced_failure', 'ok': False})
             record['verify'] = {'ok': all(c['ok'] for c in checks), 'checks': checks}
         except Exception as e:  # noqa: BLE001
-            record['verify'] = {'ok': False, 'checks': [{'check': 'exception', 'ok': False, 'error': str(e)[:200]}]}
+            record['verify'] = {'ok': False, 'checks': [{'check': 'changed_by_other' if isinstance(e, Changed) else 'exception',
+                                                         'ok': False, 'error': str(e)[:200]}]}
         record['state'] = 'applied' if record['verify']['ok'] else 'failed'
         try:
             _atomic_write(apply_path, json.dumps(record, ensure_ascii=False, indent=1), private=True)
@@ -731,15 +776,15 @@ def _restore(rec: Dict[str, Any], apply_path: Path, only_ours: bool) -> Dict[str
             if cur == b['sha256_before']:
                 restored.append({'target': b['target'], 'ok': True, 'note': 'unchanged'})
                 continue
-            if only_ours and b['target'] in after and cur != after[b['target']]:
+            if only_ours and (b['target'] not in after or cur != after[b['target']]):
+                # 기록에 예정이 없거나, 예정한 내용이 아니다 — 우리가 쓴 것이 아니므로 건드리지 않는다
                 restored.append({'target': b['target'], 'ok': False, 'note': 'changed_by_other'})
                 continue
-            if b['target'] not in after and only_ours:
-                restored.append({'target': b['target'], 'ok': False, 'note': 'not_written_but_changed'})
-                continue
             if b['backup_path']:
-                _atomic_write(target, Path(b['backup_path']).read_text(encoding='utf-8'))
+                _atomic_write(target, Path(b['backup_path']).read_text(encoding='utf-8'), expect_sha=cur)
             elif target.exists():
+                if _sha(target) != cur:
+                    raise Changed(str(target))
                 target.unlink()     # 적용이 새로 만든 파일 — 지금 내용이 우리가 쓴 그대로일 때만 여기 온다
             restored.append({'target': b['target'], 'ok': _sha(target) == b['sha256_before']})
         except Exception as e:  # noqa: BLE001
@@ -763,8 +808,10 @@ def _validate_record(rec: Any, apply_path: Path) -> Dict[str, Any]:
     allowed = {str(_real(p)) for p in (vault_json_path(), loops_path(), claude_settings_path(), Path(sb_scope.aliases_path()))}
     bdir = os.path.realpath(vault_dir() / 'backup')
     for b in rec['backups']:
-        if b.get('name') == 'aliases':
-            allowed.add(b['target'])   # 구성안이 지정한 별칭 파일(aliases_path)
+        if not isinstance(b, dict) or not isinstance(b.get('target'), str) \
+                or not isinstance(b.get('backup_path'), (str, type(None))) \
+                or not isinstance(b.get('sha256_before'), (str, type(None))):
+            raise SystemExit('적용 기록 형식이 아닙니다: %s' % apply_path)
         if b['target'] not in allowed:
             raise SystemExit('적용 기록에 볼트 밖 대상이 있어 되돌리지 않았습니다: %s' % b['target'])
         if b.get('backup_path') and not os.path.realpath(b['backup_path']).startswith(bdir + os.sep):
@@ -781,7 +828,9 @@ def rollback(apply_path: Optional[Path] = None, force: bool = False) -> Dict[str
         if rec.get('rolled_back'):
             raise SystemExit('이미 되돌린 적용입니다: %s' % apply_path)
         after = {w['target']: w['sha256_after'] for w in rec.get('writes', [])}
-        changed = [t for t, h in after.items() if _sha(Path(t)) != h]
+        before = {bk['target']: bk['sha256_before'] for bk in rec['backups']}
+        # 예정만 기록되고 쓰기 전에 멈춘 대상(지금도 적용 전 내용)은 '바뀐 파일'이 아니다
+        changed = [t for t, h in after.items() if _sha(Path(t)) not in (h, before.get(t))]
         if changed and not force:   # 적용 뒤 사용자·다른 도구가 고친 파일을 되돌리기로 덮지 않는다
             raise SystemExit('적용 뒤 바뀐 파일이 있어 되돌리지 않았습니다(--force 로 강제): ' + ', '.join(_short(c) for c in changed))
         return _restore(rec, apply_path, only_ours=not force)

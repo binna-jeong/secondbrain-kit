@@ -310,6 +310,30 @@ class ChromaPinTest(unittest.TestCase):
         self.assertIn('chromadb==1.5.9', argv)   # 기본값 = 권장판 워커 인자
         self.assertEqual(warnings, [])
 
+    def test_pin_skips_when_plugin_dir_is_broken(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem' / '13.99.0').mkdir(parents=True)   # scripts 없음
+        with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(tmp)}), \
+                mock.patch.object(inst, 'read_json', return_value={}), \
+                mock.patch.object(inst, 'run') as run, mock.patch.object(inst, 'WARNINGS', []) as warnings:
+            inst.pin_chroma_mcp({'uv': 'uv'})
+        run.assert_not_called()
+        self.assertEqual(len(warnings), 1)
+
+    def test_write_json_keeps_symlink_and_mode(self):
+        tmp = Path(tempfile.mkdtemp())
+        real = tmp / 'dot' / 'settings.json'
+        real.parent.mkdir()
+        real.write_text('{}', encoding='utf-8')
+        os.chmod(real, 0o600)
+        link = tmp / 'settings.json'
+        link.symlink_to(real)
+        with mock.patch.object(inst, 'DRY', False), mock.patch.object(inst, 'backup'):
+            inst.write_json(link, {'a': 1})
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(json.loads(real.read_text()), {'a': 1})
+        self.assertEqual(real.stat().st_mode & 0o777, 0o600)
+
     def test_pin_skips_when_installed_worker_unreadable(self):
         tmp = Path(tempfile.mkdtemp())
         root = tmp / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem' / '13.99.0' / 'scripts'

@@ -127,6 +127,19 @@ class HardeningTests(unittest.TestCase):
         self.assertFalse(cm.parse_worker_spec('var BE=["evil"];' + self.BASE)[2])
         self.assertFalse(cm.parse_worker_spec(self.BASE + 'var F0="9.9.9";')[2])
 
+    def test_array_mutation_fails_closed(self):
+        self.assertFalse(cm.parse_worker_spec(self.BASE + 'BE.push("x");')[2])
+
+    def test_comment_or_nonstatic_fake_method_fails_closed(self):
+        fake = '/* static buildLauncherPrefix(x){let r=XX.flatMap(n=>["--with",n]);return[`chroma-mcp==${YY}`]} */'
+        self.assertFalse(cm.parse_worker_spec(fake + self.BASE)[2])
+        self.assertFalse(cm.parse_worker_spec(self.BASE.replace('static buildLauncherPrefix', 'buildLauncherPrefix'))[2])
+
+    def test_branching_literal_returns_fail_closed(self):
+        t = ('class A{static buildLauncherPrefix(e){if(x)return["--with","a","--from","chroma-mcp==0.2.6","chroma-mcp"];'
+             'return["--with","b","--from","chroma-mcp==0.3.0","chroma-mcp"]}static z(){}}')
+        self.assertFalse(cm.parse_worker_spec(t)[2])
+
     def test_two_methods_fail_closed(self):
         self.assertFalse(cm.parse_worker_spec(self.BASE + self.BASE.replace('class G', 'class H'))[2])
 
@@ -136,7 +149,8 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(ver, '0.2.6-beta.1')
 
     def test_pydantic_requirement_must_actually_cap(self):
-        for worker in (['pydantic>=2.14'], ['pydantic==2.14'], ['pydantic'], ['pydantic>=2.0']):
+        for worker in (['pydantic>=2.14'], ['pydantic==2.14'], ['pydantic'], ['pydantic>=2.0'], ['pydantic~=2.13'],
+                       ['pydantic<2.14.post1'], ['pydantic<2.14rc1'], ['pydantic<2.15']):
             self.assertIn(cm.PYDANTIC_PIN, cm.tool_requirements(worker), worker)
         for worker in (['pydantic<2.14'], ['pydantic==2.13.5'], ['pydantic<2.13'], ['pydantic>=2,<2.14']):
             self.assertEqual(cm.tool_requirements(worker), worker, worker)   # 이미 보장 — 더하지 않는다

@@ -269,6 +269,88 @@ class PlanApplyTests(VaultEnv):
         self.assertIn('a-src', keys)
         self.assertIn('a-src-2', keys)
 
+    def test_rollback_rejects_aliases_entry_pointing_elsewhere(self):
+        # M5 리뷰 P0-2: 기록의 'aliases' 대상이 설정된 별칭 파일이 아니면 거부
+        p = self.plan()
+        rec = sb_vault.apply_plan(p, p['plan_hash'])
+        data = json.loads(Path(rec['apply_path']).read_text())
+        victim = self.home / 'important.txt'
+        victim.write_text('keep', encoding='utf-8')
+        for b in data['backups']:
+            if b['name'] == 'aliases':
+                b['target'] = str(victim)
+        Path(rec['apply_path']).write_text(json.dumps(data), encoding='utf-8')
+        with self.assertRaises(SystemExit):
+            sb_vault.rollback(Path(rec['apply_path']))
+        self.assertEqual(victim.read_text(), 'keep')
+
+    def test_plan_with_other_aliases_path_is_refused(self):
+        p = self.plan()
+        p['aliases_path'] = str(self.home / 'elsewhere.json')
+        p['plan_hash'] = sb_vault.plan_hash(p)
+        with self.assertRaises(SystemExit):
+            sb_vault.apply_plan(p, p['plan_hash'])
+        self.assertFalse((self.home / 'elsewhere.json').exists())
+
+    def test_broken_vault_json_aborts(self):
+        sb_vault.vault_json_path().write_text('{"version": ', encoding='utf-8')
+        before = sha(sb_vault.vault_json_path())
+        p = self.plan()
+        with self.assertRaises(SystemExit):
+            sb_vault.apply_plan(p, p['plan_hash'])
+        self.assertEqual(sha(sb_vault.vault_json_path()), before)
+
+    def test_crash_mid_apply_is_recoverable_from_journal(self):
+        # M5 리뷰 P0-3: 쓰는 도중 프로세스가 죽어도 기록의 예정 해시로 되돌린다
+        ap = self.sbhome / 'config' / 'project_aliases.json'
+        ap.write_text('{}\n', encoding='utf-8')
+        before = sha(ap)
+        p = self.plan()
+        real = sb_vault._atomic_write
+        hits = {'n': 0}
+
+        def die_on_vault_json(path, data, private=False, expect_sha=sb_vault._KEEP):
+            if Path(path).name == 'vault.json':
+                hits['n'] += 1
+                raise SystemExit('simulated crash')   # 예외 처리기도 못 도는 죽음 흉내
+            return real(path, data, private, expect_sha)
+        with mock.patch.object(sb_vault, '_atomic_write', die_on_vault_json):
+            with self.assertRaises(SystemExit):
+                sb_vault.apply_plan(p, p['plan_hash'])
+        self.assertFalse((sb_vault.vault_dir() / '.apply.lock').exists())   # with 블록이 잠금을 풀었다(kill -9 은 10분+pid 검사로 회수)
+        self.assertNotEqual(sha(ap), before)            # 별칭은 이미 바뀐 상태
+        rec = sb_vault.rollback(sb_vault.latest('apply'))
+        self.assertTrue(rec['rollback']['ok'], rec['rollback'])
+        self.assertEqual(sha(ap), before)
+
+    def test_change_between_check_and_replace_is_detected(self):
+        ap = self.sbhome / 'config' / 'project_aliases.json'
+        ap.write_text('{}\n', encoding='utf-8')
+        p = self.plan()
+        real_sha = sb_vault._sha
+        state = {'armed': False}
+
+        def racing_sha(path):
+            if state['armed'] and Path(path) == sb_vault._real(ap):
+                ap.write_text('{"other": ["/z"]}\n', encoding='utf-8')   # 다른 프로세스가 끼어든다
+                state['armed'] = False
+            return real_sha(path)
+        real_write = sb_vault._atomic_write
+
+        def arm(path, data, private=False, expect_sha=sb_vault._KEEP):
+            if Path(path) == sb_vault._real(ap):
+                state['armed'] = True
+            return real_write(path, data, private, expect_sha)
+        with mock.patch.object(sb_vault, '_sha', racing_sha), mock.patch.object(sb_vault, '_atomic_write', arm):
+            rec = sb_vault.apply_plan(p, p['plan_hash'])
+        self.assertFalse(rec['verify']['ok'])
+        self.assertIn('other', ap.read_text())            # 끼어든 변경을 덮지 않았다
+
+    def test_new_files_are_private(self):
+        p = self.plan()
+        sb_vault.apply_plan(p, p['plan_hash'])
+        self.assertEqual(sb_vault.vault_json_path().stat().st_mode & 0o777, 0o600)
+
     def test_non_git_nested_folders_share_root(self):
         ws = self.home / 'ws'
         (ws / 'sub').mkdir(parents=True)

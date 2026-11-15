@@ -118,6 +118,10 @@ def parse_worker_spec(text: str) -> Tuple[List[str], str, bool]:
     if len(found) != 1:
         return fail
     body = found[0]
+    # 본문에 return·chroma-mcp 지정·배열 펼치기가 각각 하나여야 한다(분기마다 다른 인자를 돌려주면 모른다)
+    if len(re.findall(r'\breturn\b', body)) != 1 or len(re.findall(r'chroma-mcp==', body)) != 1 \
+            or len(re.findall(r'\.flatMap\(', body)) > 1:
+        return fail
     vm = re.search(r'chroma-mcp==\$\{([\w$]+)\}', body)
     if vm:
         vals = _defs(text, vm.group(1), r'="' + _VER + '"')
@@ -134,6 +138,8 @@ def parse_worker_spec(text: str) -> Tuple[List[str], str, bool]:
         arrs = _defs(text, fm.group(1), r'=\[((?:"[^"\\]*",?)*)\]')
         if len(_defs(text, fm.group(1), r'=')) != 1 or len(arrs) != 1:
             return fail
+        if _defs(text, fm.group(1), r'\.(?:push|unshift|splice|concat|length\s*=)\b'):
+            return fail   # 정의 뒤에 배열을 바꾸는 코드가 있으면 실제 실행 값을 알 수 없다
         withs = re.findall(r'"([^"\\]*)"', arrs[0])
     else:
         withs = re.findall(r'"--with","([^"\\]*)"', body)
@@ -178,11 +184,16 @@ def _pydantic_safe(req: str) -> bool:
     if not m:
         return False
     for spec in m.group(1).split(','):
-        mm = re.match(r'(<=|<|==|~=)(\d+)\.(\d+)', spec)
+        # 숫자로만 된 판(2.13, 2.13.5)만 읽는다. rc·post·dev 같은 꼬리나 ~=(호환 판, 2.14 이상도 허용할 수 있음)는
+        # 2.14 미만을 보장한다고 보지 않는다.
+        mm = re.fullmatch(r'(<=|<|==)(\d+)\.(\d+)(?:\.(\d+))?', spec)
         if not mm:
             continue
-        major, minor = int(mm.group(2)), int(mm.group(3))
-        if major < 2 or (major == 2 and (minor < 14 if mm.group(1) != '<' else minor <= 14)):
+        op, major, minor = mm.group(1), int(mm.group(2)), int(mm.group(3))
+        patch = int(mm.group(4) or 0)
+        if op == '<' and (major, minor, patch) <= (2, 14, 0):
+            return True
+        if op in ('<=', '==') and (major, minor) < (2, 14):
             return True
     return False
 

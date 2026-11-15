@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
@@ -107,10 +108,19 @@ def write_json(path: Path, data: dict) -> None:
     if DRY:
         say('  [dry-run] write ' + str(path))
         return
+    path = Path(os.path.realpath(path)) if path.is_symlink() else path   # dotfiles 링크는 링크를 남기고 대상을 바꾼다
     path.parent.mkdir(parents=True, exist_ok=True)
     backup(path)
-    tmp = path.with_name(path.name + '.sbkit-tmp')
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    try:
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o600
+    fd, tmp = tempfile.mkstemp(prefix='.' + path.name + '.', suffix='.sbkit-tmp', dir=str(path.parent))
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, mode)
     os.replace(tmp, path)  # 원자적 교체 — 중간에 끊겨도 반쪽 JSON 이 남지 않는다
 
 
@@ -249,7 +259,9 @@ def pin_chroma_mcp(tools) -> None:
     끊기고 pydantic 최신판으로 죽는다. 같은 요구면 uv 가 건너뛰고, claude-mem 을 올린 뒤 다시 돌리면 도구를 고쳐 깐다."""
     args, ok = chroma_uvx_args()
     say('  chroma-mcp 고정 도구 (워커 인자 + %s)' % sb_claude_mem.PYDANTIC_PIN)
-    if not ok and sb_claude_mem.plugin_root() and not DRY:
+    plugin_present = bool(sb_claude_mem.plugin_root()) or (
+        sb_claude_mem.plugin_base().is_dir() and any(sb_claude_mem.plugin_base().iterdir()))
+    if not ok and plugin_present and not DRY:
         # 설치된 워커가 있는데 인자를 못 읽었다(형식 변경). 기본값으로 깔면 워커 요구와 어긋난 도구가 남아
         # 고쳤다는 착각만 준다 — 깔지 않고 알린다. 플러그인이 아직 없으면(첫 설치) 권장판 기본값으로 깐다.
         WARNINGS.append('설치된 claude-mem 워커의 chroma-mcp 인자를 읽지 못해 고정 도구를 깔지 않았습니다 — '
@@ -460,7 +472,12 @@ def setup_embedding(args, tools) -> None:
         tmp.write_text(PRECREATE, encoding='utf-8')
     env = dict(os.environ)
     env.pop('OPENAI_API_KEY', None)
-    run([tools['uvx'] or 'uvx'] + chroma_uvx_args()[0] + ['python', str(tmp), str(chroma), model], env=env)
+    args, ok = chroma_uvx_args()
+    if not ok and (sb_claude_mem.plugin_root() or (sb_claude_mem.plugin_base().is_dir()
+                                                   and any(sb_claude_mem.plugin_base().iterdir()))) and not DRY:
+        WARNINGS.append('claude-mem 워커 인자를 읽지 못해 Chroma 컬렉션 선생성을 건너뛰었습니다(첫 관측 저장 때 기본 임베딩으로 생길 수 있음)')
+        return
+    run([tools['uvx'] or 'uvx'] + args + ['python', str(tmp), str(chroma), model], env=env)
     say('  컬렉션 ef=%s' % (chroma_ef_name(chroma) or '(dry-run)'))
 
 
