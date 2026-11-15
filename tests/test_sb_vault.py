@@ -247,5 +247,107 @@ class PlanApplyTests(VaultEnv):
             self.assertEqual(sb_vault.main(['apply']), 1)
 
 
+class OnboardTests(VaultEnv):
+    def test_init_default_is_idempotent(self):
+        r = sb_vault.init_default()
+        self.assertEqual(len(r['created']), 2)
+        v = json.loads(sb_vault.vault_json_path().read_text())
+        self.assertTrue(v['default'])
+        self.assertEqual(v['kind_policy'], {'default': 'normal'})
+        self.assertIn('~', v['scope_excluded'])
+        before = sha(sb_vault.vault_json_path())
+        self.assertEqual(sb_vault.init_default()['created'], [])
+        self.assertEqual(sha(sb_vault.vault_json_path()), before)
+
+    def _add_ids(self, n):
+        con = sqlite3.connect(self.db)
+        cols = [r[1] for r in con.execute('PRAGMA table_info(observations)')]
+        if 'id' not in cols:   # 실제 claude-mem 표처럼 id 열을 둔다
+            con.execute('ALTER TABLE observations ADD COLUMN id INTEGER')
+            con.execute('UPDATE observations SET id = rowid')
+        con.execute('UPDATE observations SET id = rowid + ?', (n,))
+        con.commit(); con.close()
+
+    def test_nudge_default_vault_with_enough_records(self):
+        sb_vault.init_default()
+        self._add_ids(0)          # 관측 932건 ≥ 500
+        line = sb_vault.nudge_line('2026-11-15', str(self.db))
+        self.assertIn('sb vault analyze', line)
+        self.assertEqual(sb_vault.nudge_line('2026-11-15', str(self.db)), '')   # 하루 1회
+        self.assertIn('sb vault', sb_vault.nudge_line('2026-11-16', str(self.db)))
+        with mock.patch.dict(os.environ, {'SB_VAULT_NUDGE': '0'}):
+            self.assertEqual(sb_vault.nudge_line('2026-11-17', str(self.db)), '')
+
+    def test_nudge_quiet_after_configuring_until_growth(self):
+        self._add_ids(0)
+        p = sb_vault.make_plan(self.analysis(), None, 'all')
+        sb_vault.apply_plan(p, p['plan_hash'])
+        self.assertEqual(json.loads(sb_vault.vault_json_path().read_text())['obs_seen'], 932)
+        self.assertEqual(sb_vault.nudge_line('2026-11-15', str(self.db)), '')   # 막 구성했다
+        self._add_ids(5000)       # max id 5932 ≥ 932*1.5 그리고 +2000 이상
+        self.assertIn('늘었다', sb_vault.nudge_line('2026-11-16', str(self.db)))
+
+    def test_nudge_silent_without_db(self):
+        self.assertEqual(sb_vault.nudge_line('2026-11-15', str(self.root / 'none.db')), '')
+
+
+class InstallerOnboardTests(VaultEnv):
+    def _inst(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('kit_install_vault', BIN.parent / 'installer' / 'install.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _args(self, **kw):
+        import argparse
+        return argparse.Namespace(**dict({'no_vault_llm': True}, **kw))
+
+    def test_thin_data_makes_default_vault_only(self):
+        inst = self._inst()
+        calls = []
+
+        def fake_run(cmd, check=True, capture=False, env=None, cwd=None):
+            calls.append(cmd[2])
+            out = json.dumps({'data_volume': 'thin'}) if cmd[2] == 'analyze' else ''
+            return subprocess.CompletedProcess(cmd, 0, out, '')
+        with mock.patch.object(inst, 'run', fake_run), mock.patch.object(inst, 'say'):
+            inst.vault_onboarding(self._args())
+        self.assertEqual(calls, ['init', 'analyze'])          # 기록이 적으면 구성안을 만들지 않는다
+        self.assertNotIn('apply', calls)
+
+    def test_enough_data_makes_plan_but_never_applies(self):
+        inst = self._inst()
+        calls, envs = [], []
+
+        def fake_run(cmd, check=True, capture=False, env=None, cwd=None):
+            calls.append(cmd[2]); envs.append(env or {})
+            out = json.dumps({'data_volume': 'enough'}) if cmd[2] == 'analyze' else '구성안'
+            return subprocess.CompletedProcess(cmd, 0, out, '')
+        with mock.patch.object(inst, 'run', fake_run), mock.patch.object(inst, 'say') as say:
+            inst.vault_onboarding(self._args())
+        self.assertEqual(calls, ['init', 'analyze', 'plan'])
+        self.assertEqual(envs[1].get('SB_VAULT_LLM'), 'off')
+        self.assertTrue(any('sb vault apply' in str(c) for c in say.call_args_list))
+
+    def test_analyze_failure_is_warning(self):
+        inst = self._inst()
+        with mock.patch.object(inst, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'boom')), \
+                mock.patch.object(inst, 'say'), mock.patch.object(inst, 'WARNINGS', []) as w:
+            inst.vault_onboarding(self._args())
+        self.assertEqual(len(w), 1)
+
+    def test_real_end_to_end_on_isolated_home(self):
+        # 실제 sb_vault.py 를 자식 프로세스로: 빈 SB_HOME → init·analyze(→ thin) → 기본 볼트
+        inst = self._inst()
+        inst.SB_HOME = self.sbhome
+        inst.VPY = Path(sys.executable)
+        with mock.patch.object(inst, 'say'):
+            inst.vault_onboarding(self._args())
+        v = json.loads(sb_vault.vault_json_path().read_text())
+        self.assertTrue(v['default'])
+        self.assertTrue(list(sb_vault.vault_dir().glob('analysis-*.json')))
+
+
 if __name__ == '__main__':
     unittest.main()

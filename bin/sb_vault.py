@@ -6,6 +6,7 @@
   sb vault apply --plan F [--yes --hash H]   구성안 적용(백업 → 쓰기 → 검증 → 실패 시 자동 되돌리기)
   sb vault rollback [--apply F]              마지막(또는 지정한) 적용을 되돌린다
   sb vault status [--json]                   데이터 양·현재 볼트·마지막 적용
+  sb vault init                              기본 볼트(기록이 없거나 적을 때). 이미 있으면 그대로
 
 원칙
 - 분석은 이 PC 안에서만 한다. 네트워크는 사용자가 설정한 LLM 주소(선택)뿐이고, SB_VAULT_LLM=off 면 쓰지 않는다.
@@ -144,6 +145,7 @@ def read_claude_mem(db_path: Optional[str] = None) -> Dict[str, Any]:
             out['types'] = {t: n for t, n in db.execute('SELECT type, COUNT(*) FROM observations GROUP BY type ORDER BY 2 DESC')}
             lo, hi = db.execute('SELECT MIN(created_at_epoch), MAX(created_at_epoch) FROM observations').fetchone()
             out['span'] = [lo, hi]
+            out['max_id'] = _max_obs_id(db)
     except sqlite3.Error as e:
         out['reason'] = 'claude-mem.db 읽기 실패: %s' % e
         return out
@@ -330,7 +332,7 @@ def analyze(db_path: Optional[str] = None, projects_root: Optional[str] = None, 
         'version': SCHEMA, 'created_at': now_iso(),
         'sources': [
             {'name': 'claude-mem', 'path': _short(db_path or sb_config.claude_mem_db()), 'readable': cm['readable'],
-             'count': obs, 'sessions': sess, 'reason': cm.get('reason'),
+             'count': obs, 'sessions': sess, 'reason': cm.get('reason'), 'max_id': cm.get('max_id', 0),
              'span': [time.strftime('%Y-%m-%d', time.localtime(x / 1000)) if x else None for x in cm['span']]},
             {'name': 'claude-projects', 'path': _short(str(sync_automemory.projects_root(projects_root))),
              'readable': bool(dirs), 'count': len(dirs),
@@ -477,6 +479,7 @@ def make_plan(analysis: Dict[str, Any], analysis_ref: Optional[str] = None, stat
                                  | {'~', '/tmp', '/private/tmp', '/private/var/folders'}),
         'capture_excluded': analysis.get('capture_excluded', []),
         'minor_folders': minor[:50], 'conflicts': conflicts,
+        'obs_seen': (analysis.get('sources') or [{}])[0].get('max_id') or (analysis.get('sources') or [{}])[0].get('count', 0),
     }
     plan['plan_hash'] = plan_hash(plan)
     return plan
@@ -584,6 +587,7 @@ def apply_plan(plan: Dict[str, Any], approved_hash: str, approved_by: str = 'use
                        for s in plan['scopes']},
             'kind_policy': plan['kind_policy'], 'state_write_mode': plan['state_write_mode'],
             'scope_excluded': plan['scope_excluded'], 'updated_at': now_iso(), 'plan_hash': plan['plan_hash'],
+            'obs_seen': plan.get('obs_seen', 0),
         }, ensure_ascii=False, indent=1) + '\n')
         # 3) 미결 원장 — 없을 때만 빈 파일
         if not targets['loops'].exists():
@@ -646,6 +650,74 @@ def status() -> Dict[str, Any]:
             'last_analysis': str(latest('analysis') or '') or None, 'last_plan': str(latest('plan') or '') or None}
 
 
+# ---------------------------------------------------------------- 기본 볼트·재분석 알림
+
+DEFAULT_SCOPE_EXCLUDED = ['~', '/tmp', '/private/tmp', '/private/var/folders']
+NUDGE_GROWTH = 1.5          # 마지막 구성 때보다 관측이 이만큼 늘면 다시 분석하라고 알린다
+NUDGE_MIN_NEW = 2000        # 그리고 최소 이만큼은 늘어야 한다(작은 볼트가 매일 알림을 받지 않게)
+
+
+def _max_obs_id(db) -> int:
+    try:
+        return int(db.execute('SELECT MAX(id) FROM observations').fetchone()[0] or 0)
+    except sqlite3.Error:
+        return 0
+
+
+def init_default() -> Dict[str, Any]:
+    """기록이 없거나 적을 때의 기본 볼트. 이미 vault.json 이 있으면 아무것도 바꾸지 않는다."""
+    vj = vault_json_path()
+    created = []
+    if not vj.exists():
+        _atomic_write(vj, json.dumps({
+            'version': SCHEMA, 'scopes': {}, 'kind_policy': {'default': 'normal'}, 'state_write_mode': 'all',
+            'scope_excluded': DEFAULT_SCOPE_EXCLUDED, 'updated_at': now_iso(), 'plan_hash': None, 'obs_seen': 0,
+            'default': True}, ensure_ascii=False, indent=1) + '\n')
+        created.append(str(vj))
+    if not loops_path().exists():
+        _atomic_write(loops_path(), '')
+        created.append(str(loops_path()))
+    vault_dir().mkdir(parents=True, exist_ok=True)
+    return {'created': created, 'vault_json': str(vj)}
+
+
+def _nudge_state() -> Path:
+    return vault_dir() / 'nudge.json'
+
+
+def nudge_line(today: Optional[str] = None, db_path: Optional[str] = None) -> str:
+    """세션 시작 알림 한 줄(하루 1회 이하). 볼트가 기본 상태인데 기록이 쌓였거나, 구성 뒤 기록이 크게 늘었을 때만."""
+    if os.environ.get('SB_VAULT_NUDGE', '1') == '0':
+        return ''
+    today = today or time.strftime('%Y-%m-%d')
+    st = read_json_file(_nudge_state()) or {}
+    if st.get('last_shown') == today:
+        return ''
+    db_path = db_path or sb_config.claude_mem_db()
+    if not Path(db_path).is_file():
+        return ''
+    try:
+        with closing(_ro(db_path)) as db:
+            now_obs = _max_obs_id(db)
+    except sqlite3.Error:
+        return ''
+    v = read_json_file(vault_json_path())
+    msg = ''
+    if not isinstance(v, dict) or v.get('default') or not v.get('scopes'):
+        if now_obs >= ENOUGH_OBS:
+            msg = '볼트가 아직 기본 상태다 — 기록 %d건이 쌓였으니 `sb vault analyze` → `sb vault plan`으로 프로젝트·레이어 구성안을 만들어 사용자에게 보여 줄 수 있다' % now_obs
+    else:
+        seen = int(v.get('obs_seen') or 0)
+        if seen and now_obs >= seen * NUDGE_GROWTH and now_obs - seen >= NUDGE_MIN_NEW:
+            msg = '볼트 구성 뒤 기록이 %d건 → %d건으로 늘었다 — `sb vault analyze`·`plan`으로 새 프로젝트를 확인할 수 있다' % (seen, now_obs)
+    if msg:
+        try:
+            _atomic_write(_nudge_state(), json.dumps({'last_shown': today, 'obs': now_obs}))
+        except OSError:
+            pass
+    return msg
+
+
 # ---------------------------------------------------------------- CLI
 
 def _save(prefix: str, data: Dict[str, Any]) -> Path:
@@ -679,6 +751,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     r.add_argument('--apply')
     s = sub.add_parser('status')
     s.add_argument('--json', action='store_true')
+    sub.add_parser('init', help='기본 볼트(vault.json·빈 미결 원장)를 만든다. 이미 있으면 그대로 둔다')
     args = ap.parse_args(argv)
 
     if args.cmd == 'analyze':
@@ -734,6 +807,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print('되돌림 %s: %s' % ('완료' if rec['rollback']['ok'] else '일부 실패', ', '.join(
             '%s=%s' % (_short(r['target']), 'ok' if r['ok'] else 'FAIL') for r in rec['rollback']['restored'])))
         return 0 if rec['rollback']['ok'] else 1
+    if args.cmd == 'init':
+        r = init_default()
+        print('기본 볼트: ' + (', '.join(_short(c) for c in r['created']) + ' 생성' if r['created'] else '이미 있음 — 그대로 둠'))
+        return 0
     if args.cmd == 'status':
         st = status()
         print(json.dumps(st, ensure_ascii=False, indent=1) if args.json else

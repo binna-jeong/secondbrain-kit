@@ -218,6 +218,13 @@ def main() -> None:
         warn = ''
     if warn:
         text = (text + '\n' + warn).strip()
+    try:   # 볼트 재분석 알림(하루 1회 이하, SB_VAULT_NUDGE=0 으로 끔)
+        import sb_vault
+        nudge = sb_vault.nudge_line()
+    except Exception:  # noqa: BLE001 — 알림 실패가 세션 시작을 막으면 안 된다
+        nudge = ''
+    if nudge:
+        text = (text + '\n' + nudge).strip()
     if not text:
         return
     payload = emit(args.harness, text)

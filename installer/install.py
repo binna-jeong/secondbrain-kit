@@ -18,6 +18,7 @@
   8  에이전트 규칙 블록 (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md)
   9  sb 명령 (PATH)
   10 스케줄 (launchd / 작업 스케줄러)
+  11 볼트 온보딩: 기본 볼트(vault.json) + 기록이 있으면 분석·구성안(적용은 사용자 승인 뒤 sb vault apply)
 설정 파일을 바꾸기 전에 <파일>.sbkit-bak-<시각> 백업을 남긴다.
 """
 import argparse
@@ -67,7 +68,9 @@ def run(cmd, check=True, capture=False, env=None, cwd=None):
         say('  [dry-run] ' + shown)
         return subprocess.CompletedProcess(cmd, 0, '', '')
     say('  $ ' + shown)
+    # 받은 출력은 UTF-8 로 읽는다 — 키트 스크립트는 UTF-8 로 쓰고, 윈도우 cp949 로 읽으면 한국어가 깨진다
     return subprocess.run([str(c) for c in cmd], check=check, text=True, env=env, cwd=cwd,
+                          encoding='utf-8' if capture else None, errors='replace' if capture else None,
                           stdout=subprocess.PIPE if capture else None,
                           stderr=subprocess.PIPE if capture else None)
 
@@ -823,6 +826,36 @@ def _cron_hint(name, argv, when) -> None:
 
 
 # ── 제거 ────────────────────────────────────────────────────────────
+# ── 11 볼트 온보딩 ──────────────────────────────────────────────────
+def vault_onboarding(args) -> None:
+    """적재만 세팅되고 볼트(프로젝트·레이어 구성)가 빈 채로 남지 않게 한다. 기본 볼트를 만들고,
+    쌓인 기록이 있으면 분석·구성안까지 만든다. 적용은 하지 않는다 — 사용자가 구성안을 보고 승인해야 한다."""
+    say('\n[11] 볼트 온보딩')
+    if DRY:
+        say('  (dry-run) sb vault init / analyze / plan')
+        return
+    env = dict(os.environ, SB_HOME=str(SB_HOME))
+    if args.no_vault_llm:
+        env['SB_VAULT_LLM'] = 'off'
+    script = str(KIT / 'bin' / 'sb_vault.py')
+    run([str(VPY), script, 'init'], check=False, env=env)
+    r = run([str(VPY), script, 'analyze', '--json'], check=False, capture=True, env=env)
+    try:
+        res = json.loads(r.stdout or '{}')
+    except ValueError:
+        res = {}
+    vol = res.get('data_volume')
+    if not vol:
+        WARNINGS.append('볼트 분석 실패 — 나중에 `sb vault analyze`로 다시 확인')
+        return
+    if vol != 'enough':
+        say('  기록이 아직 적음(%s) — 기본 볼트로 시작. 기록이 쌓이면 세션 시작 때 `sb vault` 안내가 한 번 뜬다' % vol)
+        return
+    p = run([str(VPY), script, 'plan'], check=False, capture=True, env=env)
+    say(textwrap.indent((p.stdout or '').strip(), '  '))
+    say('  ▶ 위 구성안을 확인한 뒤 적용: 에이전트에게 "볼트 구성안 적용해 줘" 또는 `sb vault apply` (되돌리기 `sb vault rollback`)')
+
+
 def uninstall() -> None:
     say('제거: 훅·규칙 블록·스케줄·sb 명령 (데이터 ~/.secondbrain, ~/.claude-mem 은 남긴다)')
     for path in (HOME / '.claude' / 'settings.json', HOME / '.codex' / 'hooks.json'):
@@ -875,6 +908,8 @@ def main() -> None:
     ap.add_argument('--lang', default='ko', choices=('ko', 'en'))
     ap.add_argument('--force-settings', action='store_true')
     ap.add_argument('--reinstall-claude-mem', action='store_true')
+    ap.add_argument('--no-vault', action='store_true', help='볼트 온보딩(11단계) 생략')
+    ap.add_argument('--no-vault-llm', action='store_true', help='볼트 분석에서 LLM 이름 다듬기를 쓰지 않음')
     args = ap.parse_args()
     DRY = args.dry_run
     if args.doctor:
@@ -897,6 +932,8 @@ def main() -> None:
     rules(args, tools)
     sb_launcher()
     schedule(args)
+    if not args.no_vault:
+        vault_onboarding(args)
     if WARNINGS:
         say('\n완료(경고 %d건) — 아래를 처리한 뒤 --doctor 로 확인하세요:' % len(WARNINGS))
         for w in WARNINGS:
