@@ -140,14 +140,20 @@ def check_claude_mem_version():
     """설치된 claude-mem 이 키트 검증 범위 안인지, 워커가 고정한 chromadb 가 키트 venv 와 같은지(경고만, 차단 없음)."""
     root = sb_claude_mem.plugin_root()
     v = sb_claude_mem.installed_version(root)
+    base = sb_claude_mem.plugin_base()
     if not v:
-        return rec('⚠', 'claude-mem 버전', '플러그인 캐시에서 설치판을 못 찾음 — install.py 재실행')
+        broken = base.is_dir() and any(base.iterdir())
+        return rec('❌' if broken else '⚠', 'claude-mem 버전',
+                   '플러그인 폴더는 있으나 쓸 수 있는 워커(scripts/worker-service.cjs)가 없음 — install.py --reinstall-claude-mem'
+                   if broken else '플러그인 캐시에서 설치판을 못 찾음 — install.py 재실행')
     lo, hi = sb_claude_mem.TESTED
     if sb_claude_mem.in_tested(v):
         rec('✅', 'claude-mem 버전', '%s (키트 검증 %s~%s, 권장 %s)' % (v, lo, hi, sb_claude_mem.RECOMMENDED))
     else:
         rec('⚠', 'claude-mem 버전', '%s — 키트 검증 범위(%s~%s) 밖. 아래 chroma-mcp 기동 결과를 확인하세요' % (v, lo, hi))
     withs, _, ok = sb_claude_mem.worker_chroma_spec(root)
+    if not ok:
+        rec('⚠', 'claude-mem 워커 인자', '%s 의 chroma-mcp 인자를 읽지 못함 — 고정 도구가 워커와 어긋날 수 있음(키트 업데이트 확인)' % v)
     want = sb_claude_mem.pinned_chromadb(withs) if ok else None
     have = venv_chromadb()
     if want and have and want != have:

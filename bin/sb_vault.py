@@ -789,9 +789,11 @@ def _restore(rec: Dict[str, Any], apply_path: Path, only_ours: bool) -> Dict[str
             restored.append({'target': b['target'], 'ok': _sha(target) == b['sha256_before']})
         except Exception as e:  # noqa: BLE001
             restored.append({'target': b['target'], 'ok': False, 'error': str(e)[:160]})
-    rec['rolled_back'] = True
-    rec['state'] = 'rolled_back'
-    rec['rollback'] = {'at': now_iso(), 'restored': restored, 'ok': all(r['ok'] for r in restored)}
+    ok = all(r['ok'] for r in restored)
+    rec['rolled_back'] = ok                       # 일부라도 못 되돌렸으면 다시 시도할 수 있게 남긴다
+    rec['state'] = 'rolled_back' if ok else 'rollback_partial'
+    rec.setdefault('rollback_attempts', []).append({'at': now_iso(), 'restored': restored, 'ok': ok})
+    rec['rollback'] = {'at': now_iso(), 'restored': restored, 'ok': ok}
     try:
         _atomic_write(apply_path, json.dumps(rec, ensure_ascii=False, indent=1), private=True)
     except Exception:  # noqa: BLE001

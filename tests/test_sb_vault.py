@@ -346,6 +346,26 @@ class PlanApplyTests(VaultEnv):
         self.assertFalse(rec['verify']['ok'])
         self.assertIn('other', ap.read_text())            # 끼어든 변경을 덮지 않았다
 
+    def test_partial_rollback_can_be_retried(self):
+        (self.sbhome / 'config' / 'project_aliases.json').write_text('{}\n', encoding='utf-8')   # 백업이 있어야 복원 쓰기가 일어난다
+        p = self.plan()
+        rec = sb_vault.apply_plan(p, p['plan_hash'])
+        real = sb_vault._atomic_write
+        state = {'fail': True}
+
+        def flaky(path, data, private=False, expect_sha=sb_vault._KEEP):
+            if state['fail'] and Path(path).name == 'project_aliases.json':
+                raise OSError(13, 'Permission denied')
+            return real(path, data, private, expect_sha)
+        if True:
+            with mock.patch.object(sb_vault, '_atomic_write', flaky):
+                r1 = sb_vault.rollback(Path(rec['apply_path']))
+            self.assertFalse(r1['rollback']['ok'])
+            self.assertFalse(r1['rolled_back'])                 # 다시 시도할 수 있다
+            r2 = sb_vault.rollback(Path(rec['apply_path']), force=True)
+            self.assertTrue(r2['rollback']['ok'])
+            self.assertEqual(len(r2['rollback_attempts']), 2)
+
     def test_new_files_are_private(self):
         p = self.plan()
         sb_vault.apply_plan(p, p['plan_hash'])

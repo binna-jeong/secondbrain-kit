@@ -390,6 +390,13 @@ class ChromaPinTest(unittest.TestCase):
         self.assertEqual(r['claude-mem 버전'][0], '⚠')
         self.assertNotIn('❌', [lv for lv, _ in r.values()])
 
+    def test_doctor_flags_broken_plugin_cache(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / 'plugins' / 'cache' / 'thedotmack' / 'claude-mem' / '13.34.2').mkdir(parents=True)
+        with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(tmp)}), mock.patch.object(doctor, 'rows', []) as rows:
+            doctor.check_claude_mem_version()
+        self.assertEqual(rows[0][0], '❌')
+
     def test_doctor_flags_chromadb_mismatch(self):
         r = self._doctor_version('13.34.2', '1.5.8')
         self.assertEqual(r['chromadb 판 일치'][0], '⚠')
