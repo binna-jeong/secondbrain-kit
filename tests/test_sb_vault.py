@@ -206,6 +206,33 @@ class PlanApplyTests(VaultEnv):
         self.assertTrue(rb['rollback']['ok'])
         self.assertEqual({str(t): sha(t) for t in targets}, before)
 
+    def test_symlinked_settings_stays_a_link(self):
+        real = self.root / 'dotfiles' / 'settings.json'
+        real.parent.mkdir()
+        real.write_text('{"env": {}}\n', encoding='utf-8')
+        link = self.claude / 'settings.json'
+        link.symlink_to(real)
+        p = self.plan('listed')
+        rec = sb_vault.apply_plan(p, p['plan_hash'])
+        self.assertTrue(rec['verify']['ok'])
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(json.loads(real.read_text())['env']['SB_STATE_PILOT_SCOPES'], 'alpha')
+        sb_vault.rollback(Path(rec['apply_path']))
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(real.read_text(), '{"env": {}}\n')
+
+    def test_rollback_refuses_after_user_edit(self):
+        p = self.plan()
+        rec = sb_vault.apply_plan(p, p['plan_hash'])
+        ap = Path(p['aliases_path'])
+        ap.write_text('{"mine": ["/y"]}\n', encoding='utf-8')   # 적용 뒤 사용자가 고침
+        with self.assertRaises(SystemExit):
+            sb_vault.rollback(Path(rec['apply_path']))
+        self.assertIn('mine', ap.read_text())
+        sb_vault.rollback(Path(rec['apply_path']), force=True)
+        with self.assertRaises(SystemExit):                       # 두 번 되돌리지 않는다
+            sb_vault.rollback(Path(rec['apply_path']))
+
     def test_failed_verify_rolls_back_automatically(self):
         ap = self.sbhome / 'config' / 'project_aliases.json'
         ap.write_text('{}\n', encoding='utf-8')

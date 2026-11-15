@@ -89,6 +89,25 @@ sb health [--fix]                   # 기록층이 막힌 곳이 없는지 점�
 
 에이전트는 규칙 블록을 보고 이 명령들을 스스로 쓴다. 사람이 직접 칠 일은 드물다.
 
+## 볼트 구성 (`sb vault`)
+
+설치기는 적재(캡처·임베딩·훅·회수 서버)만이 아니라 볼트도 만든다. 볼트는 기록을 프로젝트(scope)별로 나누고, 레이어마다 어느 프로젝트를 다룰지 정한 구성이다. 정본은 `~/.secondbrain/config/vault.json` 한 파일이다.
+
+- 설치기 11단계(`--no-vault`로 끔)
+  - `sb vault init`으로 기본 볼트를 만든다. 이미 있으면 그대로 둔다.
+  - `sb vault analyze`로 이 PC의 기록을 읽는다(읽기 전용).
+  - 기록이 충분하면 `sb vault plan`의 구성안 요약을 보여 준다. **적용은 하지 않는다.**
+- 분석 대상: claude-mem 세션의 작업 폴더, 관측 꼬리표, git 최상위, Claude Code 자동 메모리. 이걸로 프로젝트 후보·별칭·상태층 쓰기 대상·규칙층 대상을 뽑는다. 홈·임시·에이전트 내부 폴더는 scope로 제안하지 않는다.
+- LLM(선택): `SB_VAULT_LLM_URL`·`SB_VAULT_MODEL`(없으면 교정 감지 설정)을 쓴다. 폴더 이름이 흔해서(`src`, `app` 등) 이름을 정하기 애매한 후보만 묻고, 폴더 이름 조각만 보낸다. `SB_VAULT_LLM=off`면 쓰지 않는다.
+- 적용: `sb vault apply`는 요약을 보여 주고 `yes`를 받는다. 에이전트는 `sb vault apply --plan <파일> --yes --hash <앞 12자>`를 쓰며, 사용자가 본 해시와 같을 때만 적용된다.
+  - 순서: 백업 → 병합 쓰기 → 검증 → 실패 시 자동 되돌리기
+  - 기존 별칭과 `SB_STATE_PILOT_SCOPES`는 덮어쓰지 않고, 다른 값이면 충돌로 보고만 한다.
+  - claude-mem 수집 제외는 바꾸지 않는다.
+- 되돌리기: `sb vault rollback`. 적용 뒤 사용자가 고친 파일이 있으면 멈추고, `--force`로 강제한다.
+- 상태층 쓰기 대상: 기본(`--state-write all`)은 env를 바꾸지 않는다(전 scope 허용). `--state-write listed`면 최근 30일 활동이 있는 scope만 허용하는 목록을 만든다.
+- 재분석 알림: 기본 볼트인데 관측이 500건을 넘었거나, 구성 뒤 기록이 1.5배·2,000건 이상 늘면 세션 시작에 한 줄 뜬다. 하루 1회 이하이고 `SB_VAULT_NUDGE=0`으로 끈다.
+- 현재 상태: `sb vault status`.
+
 ## 기록층 감시 (`sb health`)
 
 기록이 들어가는 길이나 꺼내 쓰는 길이 막혀도 겉으로는 아무 일 없어 보인다(회수는 계속 되지만 새 기록이 안 쌓이거나, 낡은 판만 나온다). 그래서 막힌 곳을 알려 주고 스스로 고친다.
@@ -194,6 +213,9 @@ Claude Code에서 도구 호출이 실패하면(PostToolUseFailure, Claude Code 
 | **기타** | | |
 | `SB_RULES_DIR` | `$SB_HOME/rules` | 규칙층 폴더(`sb rules`가 쓰고 `sb search --mode rules`가 읽는다) |
 | `SB_PROJECT_ALIASES` | `$SB_HOME/config/project_aliases.json` | scope 별칭 파일 위치 |
+| `SB_VAULT_LLM` | `auto` | `off`면 `sb vault analyze`가 LLM을 쓰지 않는다(경로 설정이 없어도 쓰지 않는다) |
+| `SB_VAULT_LLM_URL`, `SB_VAULT_MODEL`, `SB_VAULT_LLM_KEY` | 없음 | 볼트 분석의 이름 다듬기 LLM(OpenAI 호환). 없으면 교정 감지 설정을 쓴다 |
+| `SB_VAULT_NUDGE` | `1` | `0`이면 세션 시작의 볼트 재분석 알림을 끈다 |
 | `SB_OLLAMA_URL` | `http://127.0.0.1:11434` | 기록층 감시가 확인하는 Ollama 주소 |
 | `SB_RELABEL_KEEP` | `5` | 재분류할 때 만드는 DB 백업의 보존 개수 |
 | `SB_SAVE_ALLOW_EXCLUDED` | 없음 | `1`이면 수집 제외 프로젝트에도 `sb save`를 허용한다(기본은 차단) |

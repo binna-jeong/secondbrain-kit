@@ -249,7 +249,7 @@ def pin_chroma_mcp(tools) -> None:
     끊기고 pydantic 최신판으로 죽는다. 같은 요구면 uv 가 건너뛰고, claude-mem 을 올린 뒤 다시 돌리면 도구를 고쳐 깐다."""
     args, ok = chroma_uvx_args()
     say('  chroma-mcp 고정 도구 (워커 인자 + %s)' % sb_claude_mem.PYDANTIC_PIN)
-    if not ok:
+    if not ok and not DRY:   # dry-run 은 claude-mem 을 실제로 깔지 않아 읽을 워커가 없다
         WARNINGS.append('claude-mem 워커 인자를 읽지 못해 기본값(claude-mem %s 기준)으로 chroma-mcp 고정 도구를 깔았습니다 — '
                         '--doctor 의 chroma-mcp 기동 확인' % sb_claude_mem.RECOMMENDED)
     uv = tools.get('uv') or 'uv'

@@ -521,6 +521,8 @@ def _sha(p: Path) -> Optional[str]:
 
 
 def _atomic_write(p: Path, data: str) -> None:
+    # 심볼릭 링크(dotfiles 저장소로 연결한 settings.json 등)는 링크를 남기고 실제 파일을 바꾼다
+    p = Path(os.path.realpath(p)) if Path(p).is_symlink() else Path(p)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + '.sbvault-tmp')
     tmp.write_text(data, encoding='utf-8')
@@ -609,7 +611,7 @@ def apply_plan(plan: Dict[str, Any], approved_hash: str, approved_by: str = 'use
         record['verify'] = {'ok': False, 'checks': [{'check': 'exception', 'ok': False, 'error': str(e)[:200]}]}
     _atomic_write(apply_path, json.dumps(record, ensure_ascii=False, indent=1))
     if not record['verify']['ok']:
-        rollback(apply_path)
+        rollback(apply_path, force=True)
         record = read_json_file(apply_path)
     record['apply_path'] = str(apply_path)
     return record
@@ -620,16 +622,22 @@ def latest(prefix: str) -> Optional[Path]:
     return files[-1] if files else None
 
 
-def rollback(apply_path: Optional[Path] = None) -> Dict[str, Any]:
+def rollback(apply_path: Optional[Path] = None, force: bool = False) -> Dict[str, Any]:
     apply_path = Path(apply_path) if apply_path else latest('apply')
     if not apply_path or not apply_path.exists():
         raise SystemExit('되돌릴 적용 기록이 없습니다')
     rec = read_json_file(apply_path)
+    if rec.get('rolled_back'):
+        raise SystemExit('이미 되돌린 적용입니다: %s' % apply_path)
+    after = {w['target']: w['sha256_after'] for w in rec.get('writes', [])}
+    changed = [t for t, h in after.items() if _sha(Path(t)) != h]
+    if changed and not force:   # 적용 뒤 사용자·다른 도구가 고친 파일을 되돌리기로 덮지 않는다
+        raise SystemExit('적용 뒤 바뀐 파일이 있어 되돌리지 않았습니다(--force 로 강제): ' + ', '.join(_short(c) for c in changed))
     restored = []
     for b in rec['backups']:
         target = Path(b['target'])
         if b['backup_path']:
-            shutil.copy2(b['backup_path'], target)
+            _atomic_write(target, Path(b['backup_path']).read_text(encoding='utf-8'))
         elif target.exists():
             target.unlink()
         restored.append({'target': b['target'], 'ok': _sha(target) == b['sha256_before']})
@@ -643,7 +651,8 @@ def status() -> Dict[str, Any]:
     v = read_json_file(vault_json_path())
     last = latest('apply')
     rec = read_json_file(last) if last else None
-    return {'vault_json': str(vault_json_path()), 'configured': isinstance(v, dict),
+    return {'vault_json': str(vault_json_path()), 'configured': isinstance(v, dict) and not v.get('default'),
+            'default': bool(isinstance(v, dict) and v.get('default')),
             'scopes': len((v or {}).get('scopes', {})) if isinstance(v, dict) else 0,
             'last_apply': str(last) if last else None,
             'last_apply_ok': (rec or {}).get('verify', {}).get('ok'), 'rolled_back': (rec or {}).get('rolled_back'),
@@ -749,6 +758,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     x.add_argument('--hash', default='')
     r = sub.add_parser('rollback')
     r.add_argument('--apply')
+    r.add_argument('--force', action='store_true', help='적용 뒤 바뀐 파일이 있어도 되돌린다')
     s = sub.add_parser('status')
     s.add_argument('--json', action='store_true')
     sub.add_parser('init', help='기본 볼트(vault.json·빈 미결 원장)를 만든다. 이미 있으면 그대로 둔다')
@@ -803,7 +813,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print('되돌리기: sb vault rollback --apply %s' % rec['apply_path'])
         return 0 if ok else 1
     if args.cmd == 'rollback':
-        rec = rollback(Path(args.apply) if args.apply else None)
+        rec = rollback(Path(args.apply) if args.apply else None, force=args.force)
         print('되돌림 %s: %s' % ('완료' if rec['rollback']['ok'] else '일부 실패', ', '.join(
             '%s=%s' % (_short(r['target']), 'ok' if r['ok'] else 'FAIL') for r in rec['rollback']['restored'])))
         return 0 if rec['rollback']['ok'] else 1
@@ -814,7 +824,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.cmd == 'status':
         st = status()
         print(json.dumps(st, ensure_ascii=False, indent=1) if args.json else
-              '볼트: %s (scope %d개) / 마지막 적용: %s' % ('구성됨' if st['configured'] else '없음', st['scopes'],
+              '볼트: %s (scope %d개) / 마지막 적용: %s' % ('구성됨' if st['configured'] else '기본(default)' if st['default'] else '없음', st['scopes'],
                                                   st['last_apply'] or '없음'))
         return 0
     return 2
